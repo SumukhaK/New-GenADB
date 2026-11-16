@@ -1,3 +1,5 @@
 commit_hash	iteration	score	status	hypothesis_summary
 b36c7eb	0	50.406660	BASELINE	plain TCP relay splice, cleartext pairing code, no E2E, no corporate policy
 62d88f8	1	63.365155	KEEP	AES-256-GCM E2E tunnel over ephemeral X25519 (unauthenticated DH) -> no plaintext, tamper detected [device: not run]
+6e9cdeb	2	62.387383	DISCARD	SPAKE2 pairing + signed AKE + pinning + burn: solo checks all pass but corporate session broke (pins required) [device: not run]
+189603d	3	70.357118	KEEP	SPAKE2 pairing (nameplate public, secret never on wire), Ed25519-signed X25519 AKE, key pinning, burn-after-3, single-use codes, adbd touched only after auth [device: not run, Go missing on PC]
