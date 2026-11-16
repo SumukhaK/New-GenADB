@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -59,7 +61,7 @@ func dialRelay(spec string) (net.Conn, error) {
 		return nil, fmt.Errorf("unsupported relay scheme %q", u.Scheme)
 	}
 	tr := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: false,
-		TLSHandshakeTimeout: 10 * time.Second, DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext}
+		TLSHandshakeTimeout: 10 * time.Second, DialContext: relayDialContext}
 	if relayTransport.proxy != "" {
 		pu, err := url.Parse(relayTransport.proxy)
 		if err != nil {
@@ -82,7 +84,62 @@ func dialRelay(spec string) (net.Conn, error) {
 		return nil, fmt.Errorf("relay websocket: %w", err)
 	}
 	c.SetReadLimit(-1)
+	go wsKeepalive(c)
 	return websocket.NetConn(context.Background(), c, websocket.MessageBinary), nil
+}
+
+// wsKeepalive pings an otherwise idle WebSocket. Reverse proxies and tunnels
+// (and carrier NATs) drop connections that carry nothing for a minute or two,
+// which would bounce the device's control channel every couple of minutes.
+// A ping that goes unanswered is not treated as fatal: the read side reports
+// real failures, and a pong can only be seen while someone is reading.
+func wsKeepalive(c *websocket.Conn) {
+	tk := time.NewTicker(25 * time.Second)
+	defer tk.Stop()
+	for range tk.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := c.Ping(ctx)
+		cancel()
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+	}
+}
+
+// relayDialContext dials the relay (or proxy) host, remembering the addresses
+// of the last successful lookup. Agents reconnect exactly when the network is
+// misbehaving, which is also when DNS is slowest; falling back to the last
+// known addresses keeps a flaky resolver from stretching every reconnect.
+var relayAddrs sync.Map // host -> []string
+
+func relayDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || net.ParseIP(host) != nil {
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+	}
+	lctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	ips, lerr := net.DefaultResolver.LookupHost(lctx, host)
+	cancel()
+	if lerr == nil && len(ips) > 0 {
+		relayAddrs.Store(host, ips)
+	} else if v, ok := relayAddrs.Load(host); ok {
+		logf("DNS lookup for %s failed (%v); using last known addresses", host, lerr)
+		ips = v.([]string)
+	} else {
+		return nil, lerr
+	}
+	// IPv4 first, then IPv6, each with a short timeout: cellular networks
+	// often advertise an IPv6 path that black-holes.
+	sort.SliceStable(ips, func(i, j int) bool { return !strings.Contains(ips[i], ":") && strings.Contains(ips[j], ":") })
+	var last error
+	for _, ip := range ips {
+		c, err := (&net.Dialer{Timeout: 4 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ip, port))
+		if err == nil {
+			return c, nil
+		}
+		last = err
+	}
+	return nil, last
 }
 
 func relayTLSConfig() (*tls.Config, error) {
@@ -143,6 +200,7 @@ func (r *relay) serveWebSocket(addr, certFile, keyFile string) error {
 			return
 		}
 		c.SetReadLimit(-1)
+		go wsKeepalive(c)
 		nc := websocket.NetConn(context.Background(), c, websocket.MessageBinary)
 		r.handle(&wsConn{Conn: nc, remote: remote})
 	})

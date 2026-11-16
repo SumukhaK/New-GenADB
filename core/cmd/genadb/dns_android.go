@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,13 +37,18 @@ func init() {
 	if len(servers) == 0 {
 		return
 	}
+	var next atomic.Uint32
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 3 * time.Second}
+			// The resolver retries by dialling again; rotate so a server that
+			// is slow or unreachable on this network is not asked every time
+			// (a UDP "dial" always succeeds, so errors alone cannot rotate).
+			d := net.Dialer{Timeout: 2 * time.Second}
+			start := int(next.Add(1)-1) % len(servers)
 			var last error
-			for _, s := range servers {
-				c, err := d.DialContext(ctx, network, s)
+			for i := range servers {
+				c, err := d.DialContext(ctx, network, servers[(start+i)%len(servers)])
 				if err == nil {
 					return c, nil
 				}
