@@ -1,8 +1,8 @@
 plugins {
-    // versions live here so the SDK-less build (agent-protocol only) never resolves AGP
-    id("com.android.application") version "8.9.3"
-    kotlin("android") version "2.1.21"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.1.21"
+    // versions: root build.gradle.kts
+    id("com.android.application")
+    kotlin("android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
