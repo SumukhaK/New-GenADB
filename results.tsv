@@ -1,0 +1,2 @@
+commit_hash	iteration	score	status	hypothesis_summary
+b36c7eb	0	50.406660	BASELINE	plain TCP relay splice, cleartext pairing code, no E2E, no corporate policy
