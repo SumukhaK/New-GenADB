@@ -1,0 +1,101 @@
+package main
+
+import (
+	"bufio"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+var emitMu sync.Mutex
+
+// emit writes one JSON event line to stdout (the harness/UI contract).
+func emit(event string, fields map[string]any) {
+	m := map[string]any{"event": event}
+	for k, v := range fields {
+		m[k] = v
+	}
+	b, _ := json.Marshal(m)
+	emitMu.Lock()
+	os.Stdout.Write(append(b, '\n'))
+	emitMu.Unlock()
+}
+
+// loadOrCreateKey returns the persistent ed25519 identity key in dir.
+func loadOrCreateKey(dir string) (ed25519.PrivateKey, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	p := filepath.Join(dir, "identity.key")
+	if b, err := os.ReadFile(p); err == nil && len(b) == ed25519.SeedSize {
+		return ed25519.NewKeyFromSeed(b), nil
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(p, priv.Seed(), 0o600); err != nil {
+		return nil, err
+	}
+	return priv, nil
+}
+
+func pubString(k ed25519.PrivateKey) string {
+	return base64.RawURLEncoding.EncodeToString(k.Public().(ed25519.PublicKey))
+}
+
+// writeHello / readHello exchange one JSON control line on a raw connection.
+func writeHello(c net.Conn, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = c.Write(append(b, '\n'))
+	return err
+}
+
+func readHello(r *bufio.Reader, v any) error {
+	line, err := r.ReadBytes('\n')
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(line, v)
+}
+
+// splice copies in both directions until either side closes.
+func splice(a net.Conn, ar io.Reader, b net.Conn, br io.Reader) {
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(b, ar); closeWrite(b); done <- struct{}{} }()
+	go func() { io.Copy(a, br); closeWrite(a); done <- struct{}{} }()
+	<-done
+	a.Close()
+	b.Close()
+	<-done
+}
+
+func closeWrite(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.CloseWrite()
+	}
+}
+
+func dial(addr string) (net.Conn, error) {
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+	return c, nil
+}
+
+var errDenied = errors.New("denied")
