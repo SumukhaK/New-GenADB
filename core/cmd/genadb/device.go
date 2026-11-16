@@ -262,7 +262,7 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		c.Close()
 		return
 	}
-	t := newTunnel(sc, a, false)
+	t := newTunnel(sc, accelerate(a), false)
 	key := hex.EncodeToString(t.sid)
 	d.mu.Lock()
 	d.tunnels[key] = t

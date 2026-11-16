@@ -115,7 +115,7 @@ func cmdConnect(args []string) error {
 				conn.Close()
 				return
 			}
-			t := newTunnel(sc, conn, true)
+			t := newTunnel(sc, accelerate(conn), true)
 			t.run(func(t *tunnel) error { return a.rejoin(id, lan, t) })
 		}(conn)
 	}
