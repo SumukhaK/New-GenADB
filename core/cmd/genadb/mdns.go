@@ -28,9 +28,10 @@ import (
 var mdnsServer = "224.0.0.251:5353" // overridable for tests
 
 type adbdResolver struct {
-	static  string
-	service string // e.g. _adb-tls-connect._tcp.local.
-	prefer  func(net.IP) bool
+	static   string
+	service  string // e.g. _adb-tls-connect._tcp.local.
+	prefer   func(net.IP) bool
+	fallback string // used when discovery finds nothing but this endpoint accepts a connection
 
 	mu   sync.Mutex
 	last string
@@ -38,7 +39,10 @@ type adbdResolver struct {
 
 func newAdbdResolver(spec string) *adbdResolver {
 	switch spec {
-	case "auto", "mdns":
+	case "auto":
+		// Android 10 has no Wireless debugging: fall back to legacy `adb tcpip` adbd on loopback.
+		return &adbdResolver{service: "_adb-tls-connect._tcp.local.", prefer: isLocalIP, fallback: "127.0.0.1:5555"}
+	case "mdns":
 		return &adbdResolver{service: "_adb-tls-connect._tcp.local.", prefer: isLocalIP}
 	case "auto-legacy":
 		return &adbdResolver{service: "_adb._tcp.local.", prefer: isLocalIP}
@@ -66,7 +70,7 @@ func (r *adbdResolver) refresh() (string, error) {
 		return r.static, nil
 	}
 	eps, err := browse(r.service, 1500*time.Millisecond)
-	if err != nil {
+	if err != nil && r.fallback == "" {
 		return "", err
 	}
 	var pick string
@@ -74,6 +78,12 @@ func (r *adbdResolver) refresh() (string, error) {
 		host, _, _ := net.SplitHostPort(ep)
 		if pick == "" || (r.prefer != nil && r.prefer(net.ParseIP(host))) {
 			pick = ep
+		}
+	}
+	if pick == "" && r.fallback != "" {
+		if c, derr := net.DialTimeout("tcp", r.fallback, 500*time.Millisecond); derr == nil {
+			c.Close()
+			pick = r.fallback
 		}
 	}
 	if pick == "" {

@@ -175,3 +175,29 @@ func TestPinsPersist(t *testing.T) {
 		t.Fatal("unknown device must not be pinned")
 	}
 }
+
+// Android 10 has no Wireless debugging: --adbd auto must fall back to legacy tcpip adbd.
+func TestAdbdAutoFallsBackToLegacy(t *testing.T) {
+	old := mdnsServer
+	defer func() { mdnsServer = old }()
+	u, err := net.ListenPacket("udp", "127.0.0.1:0") // silent mDNS: nothing advertised
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	mdnsServer = u.LocalAddr().String()
+	l, err := net.Listen("tcp", "127.0.0.1:0") // stands in for legacy adbd
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	r := newAdbdResolver("auto")
+	r.fallback = l.Addr().String()
+	if got, err := r.refresh(); err != nil || got != l.Addr().String() {
+		t.Fatalf("got %q, %v; want fallback %s", got, err, l.Addr())
+	}
+	r = newAdbdResolver("mdns") // explicit mdns: no fallback
+	if _, err := r.refresh(); err == nil {
+		t.Fatal("mdns mode must not fall back")
+	}
+}
