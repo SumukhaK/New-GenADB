@@ -1,2 +1,3 @@
 commit_hash	iteration	score	status	hypothesis_summary
 b36c7eb	0	50.406660	BASELINE	plain TCP relay splice, cleartext pairing code, no E2E, no corporate policy
+62d88f8	1	63.365155	KEEP	AES-256-GCM E2E tunnel over ephemeral X25519 (unauthenticated DH) -> no plaintext, tamper detected [device: not run]
