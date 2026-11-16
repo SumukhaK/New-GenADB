@@ -21,8 +21,9 @@ import (
 const maxPairFailures = 3
 
 type deviceAgent struct {
-	relayAddr, adbd, state, mode, id string
-	key                              ed25519.PrivateKey
+	relayAddr, state, mode, id string
+	adbd                       *adbdResolver
+	key                        ed25519.PrivateKey
 
 	mu        sync.Mutex
 	nameplate string
@@ -55,7 +56,7 @@ func (d *deviceAgent) serveLAN(ln net.Listener) {
 func cmdDevice(args []string) error {
 	fs := flag.NewFlagSet("device", flag.ContinueOnError)
 	relayAddr := fs.String("relay", "", "relay address")
-	adbd := fs.String("adbd", "127.0.0.1:5555", "local adbd endpoint")
+	adbd := fs.String("adbd", "127.0.0.1:5555", "adbd endpoint host:port, or 'auto' to discover Wireless debugging via mDNS (auto-legacy: _adb._tcp)")
 	state := fs.String("state", ".", "state directory")
 	mode := fs.String("mode", "solo", "solo|corporate")
 	fs.String("name", "", "device name")
@@ -81,7 +82,7 @@ func cmdDevice(args []string) error {
 	if err != nil {
 		return err
 	}
-	d := &deviceAgent{relayAddr: *relayAddr, adbd: *adbd, state: *state, mode: *mode, id: id, key: key,
+	d := &deviceAgent{relayAddr: *relayAddr, adbd: newAdbdResolver(*adbd), state: *state, mode: *mode, id: id, key: key,
 		pins: loadPins(*state), token: *enroll, tunnels: map[string]*tunnel{}}
 	if d.mode == "corporate" {
 		if d.pol, err = loadPolicy(*policyPath); err != nil {
@@ -276,8 +277,9 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		c.Close()
 		return
 	}
-	a, err := dial(d.adbd) // adbd is only touched after authentication
+	a, err := d.dialAdbd() // adbd is only touched after authentication
 	if err != nil {
+		emit("adbd_unreachable", map[string]any{"reason": err.Error()})
 		c.Close()
 		return
 	}
@@ -346,4 +348,25 @@ func randDigits(n int) string {
 		sb.WriteByte(byte('0' + v.Int64()))
 	}
 	return sb.String()
+}
+
+// dialAdbd connects to the current adbd endpoint, re-discovering it once if
+// the remembered port stopped working (Wireless debugging toggled, network
+// change).
+func (d *deviceAgent) dialAdbd() (net.Conn, error) {
+	addr, err := d.adbd.current()
+	if err == nil {
+		var c net.Conn
+		if c, err = dial(addr); err == nil {
+			return c, nil
+		}
+	}
+	addr, rerr := d.adbd.refresh()
+	if rerr != nil {
+		if err == nil {
+			err = rerr
+		}
+		return nil, err
+	}
+	return dial(addr)
 }
