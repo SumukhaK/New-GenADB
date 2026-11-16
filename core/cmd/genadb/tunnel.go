@@ -180,7 +180,7 @@ func (t *tunnel) run(reconnect func(t *tunnel) error) {
 				return
 			}
 			time.Sleep(backoff)
-			if backoff < 2*time.Second {
+			if backoff < 400*time.Millisecond {
 				backoff *= 2
 			}
 		}
