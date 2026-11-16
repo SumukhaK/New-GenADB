@@ -78,14 +78,15 @@ type accelStream struct {
 }
 
 type adbAccel struct {
-	local  net.Conn // real endpoint (adb host or adbd)
-	tun    net.Conn // pipe end facing the tunnel
-	lmu    sync.Mutex
-	mu     sync.Mutex
-	cond   *sync.Cond
-	off    bool                    // passthrough mode
-	st     map[uint32]*accelStream // keyed by the local endpoint's stream id
-	queued int
+	local                 net.Conn // real endpoint (adb host or adbd)
+	tun                   net.Conn // pipe end facing the tunnel
+	lmu                   sync.Mutex
+	mu                    sync.Mutex
+	cond                  *sync.Cond
+	off                   bool // passthrough mode
+	dackLocal, dackRemote bool
+	st                    map[uint32]*accelStream // keyed by the local endpoint's stream id
+	queued                int
 }
 
 // accelerate returns the conn the tunnel should use in place of local.
@@ -134,9 +135,18 @@ func (x *adbAccel) passthrough(src io.Reader, dst io.Writer, pending []byte) {
 	x.shutdown()
 }
 
-func (x *adbAccel) checkCNXN(m *adbMsg) {
+// checkCNXN: delayed_ack changes OKAY semantics but is only negotiated when
+// both ends advertise it (newer hosts always do; Android 10 devices do not).
+func (x *adbAccel) checkCNXN(m *adbMsg, fromLocal bool) {
 	if m.cmd == aCNXN && bytes.Contains(m.raw[24:], []byte("delayed_ack")) {
-		x.off = true
+		if fromLocal {
+			x.dackLocal = true
+		} else {
+			x.dackRemote = true
+		}
+		if x.dackLocal && x.dackRemote {
+			x.off = true
+		}
 	}
 	if m.cmd == aSTLS {
 		x.off = true
@@ -152,7 +162,7 @@ func (x *adbAccel) fromLocal() {
 			return
 		}
 		x.mu.Lock()
-		x.checkCNXN(m)
+		x.checkCNXN(m, true)
 		if x.off {
 			x.mu.Unlock()
 			x.passthroughLocal(m)
@@ -228,7 +238,7 @@ func (x *adbAccel) fromTunnel() {
 			return
 		}
 		x.mu.Lock()
-		x.checkCNXN(m)
+		x.checkCNXN(m, false)
 		if x.off {
 			// flush anything still queued, then pass through
 			x.mu.Unlock()
