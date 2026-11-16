@@ -91,8 +91,8 @@ func dialRelay(spec string) (net.Conn, error) {
 // wsKeepalive pings an otherwise idle WebSocket. Reverse proxies and tunnels
 // (and carrier NATs) drop connections that carry nothing for a minute or two,
 // which would bounce the device's control channel every couple of minutes.
-// A ping that goes unanswered is not treated as fatal: the read side reports
-// real failures, and a pong can only be seen while someone is reading.
+// Pongs are only seen while someone reads the connection; relay clients
+// always keep a reader running, so a missing pong means the path is dead.
 func wsKeepalive(c *websocket.Conn) {
 	tk := time.NewTicker(25 * time.Second)
 	defer tk.Stop()
@@ -100,7 +100,13 @@ func wsKeepalive(c *websocket.Conn) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := c.Ping(ctx)
 		cancel()
-		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				// No pong within 10 s while the reader is running: the
+				// path is dead (e.g. a phone that lost its radio without a
+				// reset). Close so both sides reconnect instead of hanging.
+				c.Close(websocket.StatusGoingAway, "keepalive timeout")
+			}
 			return
 		}
 	}

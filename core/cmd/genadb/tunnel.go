@@ -28,7 +28,17 @@ const (
 
 	maxUnacked   = 16 << 20
 	ackEvery     = 128 << 10
-	rejoinWindow = 45 * time.Second
+	rejoinWindow = 90 * time.Second // covers a minute-long radio loss plus dead-peer detection
+
+	// End-to-end liveness. Relays, tunnels and carrier NATs can keep one leg
+	// of a spliced path open after the other leg died (a phone losing its
+	// cellular link for 40 s left the desktop leg healthy and the session
+	// silently stuck). Each side sends a keepalive inside the secure channel
+	// when it has written nothing for a while, and treats a path on which it
+	// has received nothing for deadPeerAfter as broken, which triggers the
+	// normal authenticated rejoin.
+	keepaliveEvery = 5 * time.Second
+	deadPeerAfter  = 20 * time.Second
 )
 
 type tunnel struct {
@@ -50,6 +60,7 @@ type tunnel struct {
 	unacked  int // bytes received since last ACK
 	closed   bool
 	broken   chan struct{} // signalled when current conn fails
+	lastRecv time.Time     // last record received on the current conn
 }
 
 func newTunnel(sc *secureConn, local net.Conn, initiator bool) *tunnel {
@@ -67,6 +78,7 @@ func (t *tunnel) sendEnd() uint64 { return t.sendBase + uint64(len(t.sendBuf)) }
 func (t *tunnel) attach(sc *secureConn, peerRecv uint64) {
 	t.mu.Lock()
 	t.conn = sc
+	t.lastRecv = time.Now()
 	t.epoch++
 	ep := t.epoch
 	t.ackLocked(peerRecv)
@@ -139,6 +151,7 @@ func (t *tunnel) run(reconnect func(t *tunnel) error) {
 	go t.localReader()
 	go t.sender()
 	go t.acker()
+	go t.watchdog()
 	for {
 		<-t.broken
 		t.mu.Lock()
@@ -249,10 +262,12 @@ func (t *tunnel) sender() {
 	}
 }
 
-// acker flushes cumulative ACKs for small trickles of data.
+// acker flushes cumulative ACKs for small trickles of data, sends keepalives
+// (a repeated cumulative ACK is harmless) and detects a dead peer.
 func (t *tunnel) acker() {
 	tk := time.NewTicker(100 * time.Millisecond)
 	defer tk.Stop()
+	lastKeepalive := time.Now()
 	for range tk.C {
 		t.mu.Lock()
 		if t.closed {
@@ -264,10 +279,36 @@ func (t *tunnel) acker() {
 			t.unacked = 0
 		}
 		t.mu.Unlock()
-		if pend > 0 && c != nil {
+		if c != nil && pend == 0 && time.Since(lastKeepalive) >= keepaliveEvery {
+			pend = -1 // keepalive
+		}
+		if pend != 0 && c != nil {
+			lastKeepalive = time.Now()
 			if _, err := c.Write(record(recAck, off, nil)); err != nil {
 				t.fail(ep)
 			}
+		}
+	}
+}
+
+// watchdog declares the current path dead when nothing has arrived on it for
+// deadPeerAfter. It never writes, so a write blocked on a dead path (full
+// socket buffers) cannot stall detection.
+func (t *tunnel) watchdog() {
+	tk := time.NewTicker(time.Second)
+	defer tk.Stop()
+	for range tk.C {
+		t.mu.Lock()
+		if t.closed {
+			t.mu.Unlock()
+			return
+		}
+		ep, idle := t.epoch, time.Since(t.lastRecv)
+		dead := t.conn != nil && idle > deadPeerAfter
+		t.mu.Unlock()
+		if dead {
+			logf("tunnel peer silent for %s; treating path as broken", idle.Round(time.Second))
+			t.fail(ep)
 		}
 	}
 }
@@ -281,6 +322,11 @@ func (t *tunnel) reader(sc *secureConn, ep int) {
 			return
 		}
 		typ, off, payload := buf[0], binary.BigEndian.Uint64(buf[1:9]), buf[9:n]
+		t.mu.Lock()
+		if ep == t.epoch {
+			t.lastRecv = time.Now()
+		}
+		t.mu.Unlock()
 		switch typ {
 		case recData:
 			t.mu.Lock()
