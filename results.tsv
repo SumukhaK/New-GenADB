@@ -10,3 +10,4 @@ a691c32	7	98.253314	KEEP	cap rejoin backoff ~400-800ms: tunnel resumes right aft
 bba054b	8	98.973711	KEEP	ADB-aware split flow control (local WRTE acks + paced delivery, plaintext adbd only, passthrough on STLS/delayed_ack): push 5.7->11.7 MB/s, logcat latency 86->44ms [device: not run, Go missing on PC]
 2fa124a	9	98.982365	DISCARD	256KiB AEAD frames: +0.01, within noise; push is RTT/link bound (3 unspoofable RTTs + 25MB/s link cap) [device: not run]
 5e2aa59	10	98.967805	KEEP	Milestone B+C: ws/wss relay transport + CONNECT proxy + relay rate limiting; no regression (tests/transport_e2e.py PASS: ws 98.83, wss 98.74, wss+proxy 98.67) [device: pending]
+b24391e	11	98.982106	KEEP	Milestone C: mDNS discovery/tracking of the dynamic Wireless-debugging port (--adbd auto) + go unit tests; no regression [device: pending]
