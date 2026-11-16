@@ -281,7 +281,7 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		c.Close()
 		return
 	}
-	a, err := d.dialAdbd() // adbd is only touched after authentication
+	a, err := d.dialAdbdPatiently() // adbd is only touched after authentication
 	if err != nil {
 		logf("adbd unreachable: %v", err)
 		emit("adbd_unreachable", map[string]any{"reason": err.Error()})
@@ -353,6 +353,32 @@ func randDigits(n int) string {
 		sb.WriteByte(byte('0' + v.Int64()))
 	}
 	return sb.String()
+}
+
+// adbdWait bounds how long an authenticated session waits for adbd to become
+// reachable (a dozing radio or adbd restarting after a Wireless-debugging
+// toggle) before giving up. It stays under adb's own 10 s connect timeout
+// budget for the common case of a single slow attempt.
+const adbdWait = 12 * time.Second
+
+func (d *deviceAgent) dialAdbdPatiently() (net.Conn, error) {
+	deadline := time.Now().Add(adbdWait)
+	for attempt := 1; ; attempt++ {
+		c, err := d.dialAdbd()
+		if err == nil {
+			if attempt > 1 {
+				logf("adbd reachable after %d attempts", attempt)
+			}
+			return c, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		if attempt == 1 {
+			logf("adbd not reachable yet (%v); retrying for up to %s", err, adbdWait)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 }
 
 // dialAdbd connects to the current adbd endpoint, re-discovering it once if
