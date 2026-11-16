@@ -32,6 +32,22 @@ type deviceAgent struct {
 	ctrlMu    sync.Mutex
 	pol       *policy
 	token     string
+	lan       string
+}
+
+// serveLAN accepts direct connections from desktops on the same network.
+// They go through exactly the same authenticated handshake as relayed ones.
+func (d *deviceAgent) serveLAN(ln net.Listener) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		if tc, ok := c.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
+		go d.serveStream(c)
+	}
 }
 
 func cmdDevice(args []string) error {
@@ -44,8 +60,8 @@ func cmdDevice(args []string) error {
 	enroll := fs.String("enroll", "", "device enrollment JWT (corporate)")
 	policyPath := fs.String("policy", "", "policy file (corporate)")
 	debugPolicy := fs.String("debug-policy", "allowed", "allowed|disallowed (MDM DISALLOW_DEBUGGING_FEATURES)")
-	fs.String("lan-listen", "", "LAN listen address")
-	fs.String("lan-advertise", "", "LAN advertised address")
+	lanListen := fs.String("lan-listen", "", "LAN listen address (solo: direct path)")
+	lanAdvertise := fs.String("lan-advertise", "", "LAN address to advertise (default: lan-listen)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -74,6 +90,17 @@ func cmdDevice(args []string) error {
 	}
 	if d.mode == "solo" {
 		d.newCode()
+		if *lanListen != "" {
+			ln, err := net.Listen("tcp", *lanListen)
+			if err != nil {
+				return err
+			}
+			d.lan = *lanAdvertise
+			if d.lan == "" {
+				d.lan = ln.Addr().String()
+			}
+			go d.serveLAN(ln)
+		}
 	}
 	announced := false
 	for {
@@ -100,7 +127,7 @@ func (d *deviceAgent) rotateCode() {
 	d.emitCode()
 	d.ctrlMu.Lock()
 	if d.ctrl != nil {
-		writeHello(d.ctrl, hello{Role: "device", DeviceID: d.id, Code: np})
+		writeHello(d.ctrl, hello{Role: "device", DeviceID: d.id, Code: np, LAN: d.lan})
 	}
 	d.ctrlMu.Unlock()
 }
@@ -115,7 +142,7 @@ func (d *deviceAgent) session(announced *bool) error {
 	d.mu.Lock()
 	np := d.nameplate
 	d.mu.Unlock()
-	rep, err := relayHello(c, br, hello{Role: "device", DeviceID: d.id, Code: np, Identity: d.token}, d.key)
+	rep, err := relayHello(c, br, hello{Role: "device", DeviceID: d.id, Code: np, Identity: d.token, LAN: d.lan}, d.key)
 	if err != nil {
 		return err
 	}
@@ -204,6 +231,10 @@ func (d *deviceAgent) openData(sid string) {
 		c.Close()
 		return
 	}
+	d.serveStream(c)
+}
+
+func (d *deviceAgent) serveStream(c net.Conn) {
 	sc, _, err := serverHandshake(c, c, d.policy())
 	if err != nil {
 		c.Close()

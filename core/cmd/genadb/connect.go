@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type desktopAgent struct {
@@ -88,10 +89,11 @@ func cmdConnect(args []string) error {
 		params.pinnedPeer = pinned
 	}
 	// verify the device is reachable and still trusts us before exposing a port
-	c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
+	c, br, rep0, err := a.openSessionRep(hello{Role: "desktop", DeviceID: id})
 	if err != nil {
 		return err
 	}
+	lan := rep0.LAN
 	_, _, err = clientHandshake(c, br, params)
 	c.Close()
 	if err != nil {
@@ -108,6 +110,19 @@ func cmdConnect(args []string) error {
 			return err
 		}
 		go func(conn net.Conn) {
+			// prefer a direct LAN path (same handshake, same keys policy)
+			if lan != "" {
+				if dc, err := net.DialTimeout("tcp", lan, 700*time.Millisecond); err == nil {
+					if tc, ok := dc.(*net.TCPConn); ok {
+						tc.SetNoDelay(true)
+					}
+					if sc, _, err := clientHandshake(dc, dc, params); err == nil {
+						splice(conn, conn, sc, sc)
+						return
+					}
+					dc.Close()
+				}
+			}
 			c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
 			if err != nil {
 				conn.Close()
@@ -124,24 +139,29 @@ func cmdConnect(args []string) error {
 	}
 }
 
-// openSession asks the relay for a spliced stream to the device.
 func (a *desktopAgent) openSession(h hello) (net.Conn, *bufio.Reader, string, error) {
+	c, br, rep, err := a.openSessionRep(h)
+	return c, br, rep.DeviceID, err
+}
+
+// openSessionRep asks the relay for a spliced stream to the device.
+func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, error) {
 	c, err := dial(a.relayAddr)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, reply{}, err
 	}
 	br := bufio.NewReader(c)
 	h.Identity = a.token
 	rep, err := relayHello(c, br, h, a.key)
 	if err != nil {
 		c.Close()
-		return nil, nil, "", err
+		return nil, nil, reply{}, err
 	}
 	if !rep.OK {
 		c.Close()
-		return nil, nil, "", fmt.Errorf("%w: %s", errDenied, rep.Reason)
+		return nil, nil, reply{}, fmt.Errorf("%w: %s", errDenied, rep.Reason)
 	}
-	return c, br, rep.DeviceID, nil
+	return c, br, rep, nil
 }
 
 func peerPath(state, id string) string {

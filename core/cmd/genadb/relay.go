@@ -26,6 +26,7 @@ type hello struct {
 	Identity string `json:"identity,omitempty"`
 	Pub      string `json:"pub,omitempty"`
 	Sig      []byte `json:"sig,omitempty"`
+	LAN      string `json:"lan,omitempty"` // solo only: device's direct LAN endpoint
 }
 
 type reply struct {
@@ -34,11 +35,13 @@ type reply struct {
 	Reason    string `json:"reason,omitempty"`
 	Open      string `json:"open,omitempty"`
 	Challenge []byte `json:"challenge,omitempty"`
+	LAN       string `json:"lan,omitempty"`
 }
 
 type deviceEntry struct {
 	conn net.Conn
 	code string
+	lan  string
 	wmu  sync.Mutex
 }
 
@@ -245,6 +248,9 @@ func (r *relay) handle(c net.Conn) {
 		}
 		c.SetReadDeadline(time.Time{})
 		e := &deviceEntry{conn: c, code: h.Code}
+		if !r.corporate {
+			e.lan = h.LAN
+		}
 		r.mu.Lock()
 		for did, o := range r.devices {
 			if h.Code != "" && o.code == h.Code && did != h.DeviceID {
@@ -373,7 +379,7 @@ func (r *relay) handle(c net.Conn) {
 				defer t.Stop()
 			}
 		}
-		writeHello(c, reply{OK: true, DeviceID: id})
+		writeHello(c, reply{OK: true, DeviceID: id, LAN: e.lan})
 		splice(c, br, dc, dbr)
 		r.mu.Lock()
 		delete(r.sessions, sid)
