@@ -2,80 +2,142 @@ package main
 
 import (
 	"bufio"
+	"crypto/ed25519"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 )
+
+type desktopAgent struct {
+	relayAddr, state string
+	key              ed25519.PrivateKey
+}
 
 func cmdConnect(args []string) error {
 	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
 	relayAddr := fs.String("relay", "", "relay address")
 	state := fs.String("state", ".", "state directory")
 	listen := fs.String("listen", "127.0.0.1:0", "local adb endpoint to expose")
-	fs.String("mode", "solo", "solo|corporate")
-	code := fs.String("code", "", "pairing code shown on the phone")
+	mode := fs.String("mode", "solo", "solo|corporate")
+	code := fs.String("code", "", "pairing code shown on the phone (NNNN-SSSSSS)")
 	device := fs.String("device", "", "previously paired device id")
 	fs.String("identity", "", "user identity JWT (corporate)")
 	fs.String("policy", "", "policy file (corporate)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if _, err := loadOrCreateKey(*state); err != nil {
-		return err
-	}
-	// resolve the device once (probe), then expose a local listener
-	c, err := dial(*relayAddr)
+	key, err := loadOrCreateKey(*state)
 	if err != nil {
 		return err
 	}
-	br := bufio.NewReader(c)
-	if err := writeHello(c, hello{Role: "desktop", Code: *code, DeviceID: *device, Probe: true}); err != nil {
+	a := &desktopAgent{relayAddr: *relayAddr, state: *state, key: key}
+	id := *device
+	if *code != "" {
+		np, secret, ok := strings.Cut(*code, "-")
+		if !ok {
+			return fmt.Errorf("pairing code must look like NNNN-SSSSSS")
+		}
+		c, br, did, err := a.openSession(hello{Role: "desktop", Code: np})
+		if err != nil {
+			return err
+		}
+		_, peer, err := clientHandshake(c, br, initiatorParams{id: key, mode: "pair", secret: secret, nameplate: np})
+		c.Close()
+		if err != nil {
+			return fmt.Errorf("%w: %v", errDenied, err)
+		}
+		if err := savePeer(*state, did, peer); err != nil {
+			return err
+		}
+		id = did
+	}
+	pinned, err := loadPeer(*state, id)
+	if err != nil && *mode != "corporate" {
+		return fmt.Errorf("%w: device %q is not paired with this computer", errDenied, id)
+	}
+	// verify the device is reachable and still trusts us before exposing a port
+	c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
+	if err != nil {
 		return err
 	}
-	var rep reply
-	if err := readHello(br, &rep); err != nil {
-		return err
-	}
+	_, _, err = clientHandshake(c, br, initiatorParams{id: key, mode: "resume", pinnedPeer: pinned})
 	c.Close()
-	if !rep.OK {
-		return fmt.Errorf("%w: %s", errDenied, rep.Reason)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errDenied, err)
 	}
-	id := rep.DeviceID
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
 	}
 	emit("listening", map[string]any{"addr": ln.Addr().String(), "device_id": id})
 	for {
-		a, err := ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		go func(a net.Conn) {
-			c, err := dial(*relayAddr)
+		go func(conn net.Conn) {
+			c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
 			if err != nil {
-				a.Close()
+				conn.Close()
 				return
 			}
-			br := bufio.NewReader(c)
-			if writeHello(c, hello{Role: "desktop", DeviceID: id}) != nil {
-				a.Close()
-				c.Close()
-				return
-			}
-			var rep reply
-			if readHello(br, &rep) != nil || !rep.OK {
-				a.Close()
-				c.Close()
-				return
-			}
-			sc, err := handshake(c, br, true)
+			sc, _, err := clientHandshake(c, br, initiatorParams{id: key, mode: "resume", pinnedPeer: pinned})
 			if err != nil {
-				a.Close()
+				conn.Close()
 				c.Close()
 				return
 			}
-			splice(a, a, sc, sc)
-		}(a)
+			splice(conn, conn, sc, sc)
+		}(conn)
 	}
+}
+
+// openSession asks the relay for a spliced stream to the device.
+func (a *desktopAgent) openSession(h hello) (net.Conn, *bufio.Reader, string, error) {
+	c, err := dial(a.relayAddr)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	br := bufio.NewReader(c)
+	if err := writeHello(c, h); err != nil {
+		c.Close()
+		return nil, nil, "", err
+	}
+	var rep reply
+	if err := readHello(br, &rep); err != nil {
+		c.Close()
+		return nil, nil, "", err
+	}
+	if !rep.OK {
+		c.Close()
+		return nil, nil, "", fmt.Errorf("%w: %s", errDenied, rep.Reason)
+	}
+	return c, br, rep.DeviceID, nil
+}
+
+func peerPath(state, id string) string {
+	return filepath.Join(state, "peers", base64.RawURLEncoding.EncodeToString([]byte(id)))
+}
+
+func savePeer(state, id string, k ed25519.PublicKey) error {
+	if err := os.MkdirAll(filepath.Join(state, "peers"), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(peerPath(state, id), []byte(base64.RawURLEncoding.EncodeToString(k)), 0o600)
+}
+
+func loadPeer(state, id string) (ed25519.PublicKey, error) {
+	b, err := os.ReadFile(peerPath(state, id))
+	if err != nil {
+		return nil, err
+	}
+	k, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil || len(k) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("corrupt pin")
+	}
+	return ed25519.PublicKey(k), nil
 }

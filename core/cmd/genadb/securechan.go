@@ -3,10 +3,6 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/ecdh"
-	"crypto/hkdf"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -97,48 +93,4 @@ func (s *secureConn) Read(p []byte) (int, error) {
 	n := copy(p, s.rbuf)
 	s.rbuf = s.rbuf[n:]
 	return n, nil
-}
-
-// handshake runs an ephemeral X25519 exchange over the relayed stream and
-// derives per-direction AEAD keys bound to the transcript.
-func handshake(c net.Conn, r io.Reader, initiator bool) (*secureConn, error) {
-	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	mine := priv.PublicKey().Bytes()
-	if _, err := c.Write(mine); err != nil {
-		return nil, err
-	}
-	theirs := make([]byte, 32)
-	if _, err := io.ReadFull(r, theirs); err != nil {
-		return nil, err
-	}
-	pk, err := ecdh.X25519().NewPublicKey(theirs)
-	if err != nil {
-		return nil, err
-	}
-	shared, err := priv.ECDH(pk)
-	if err != nil {
-		return nil, err
-	}
-	var ti, tr []byte
-	if initiator {
-		ti, tr = mine, theirs
-	} else {
-		ti, tr = theirs, mine
-	}
-	th := sha256.Sum256(append(append([]byte("genadb-hs-v1"), ti...), tr...))
-	keys, err := hkdf.Key(sha256.New, shared, th[:], "genadb session keys", 64)
-	if err != nil {
-		return nil, err
-	}
-	i2r, r2i := newAEAD(keys[:32]), newAEAD(keys[32:])
-	s := &secureConn{Conn: c, r: r}
-	if initiator {
-		s.sendA, s.recvA = i2r, r2i
-	} else {
-		s.sendA, s.recvA = r2i, i2r
-	}
-	return s, nil
 }

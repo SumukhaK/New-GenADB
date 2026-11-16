@@ -78,15 +78,26 @@ func (r *relay) handle(c net.Conn) {
 	case "device":
 		e := &deviceEntry{conn: c, code: h.Code}
 		r.mu.Lock()
+		for did, o := range r.devices {
+			if h.Code != "" && o.code == h.Code && did != h.DeviceID {
+				r.mu.Unlock()
+				writeHello(c, reply{OK: false, Reason: "nameplate taken"})
+				c.Close()
+				return
+			}
+		}
 		r.devices[h.DeviceID] = e
 		r.mu.Unlock()
 		writeHello(c, reply{OK: true})
-		// control connection: block until closed
-		buf := make([]byte, 1)
+		// control connection: the device may announce a new nameplate
 		for {
-			if _, err := br.Read(buf); err != nil {
+			var upd hello
+			if err := readHello(br, &upd); err != nil {
 				break
 			}
+			r.mu.Lock()
+			e.code = upd.Code
+			r.mu.Unlock()
 		}
 		r.mu.Lock()
 		if r.devices[h.DeviceID] == e {
@@ -110,7 +121,7 @@ func (r *relay) handle(c net.Conn) {
 		if h.Code != "" {
 			id = ""
 			for did, e := range r.devices {
-				if e.code == h.Code {
+				if e.code != "" && e.code == h.Code {
 					id = did
 				}
 			}

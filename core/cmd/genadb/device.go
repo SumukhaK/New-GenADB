@@ -2,17 +2,35 @@ package main
 
 import (
 	"bufio"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+const maxPairFailures = 3
+
+type deviceAgent struct {
+	relayAddr, adbd, state, mode, id string
+	key                              ed25519.PrivateKey
+
+	mu        sync.Mutex
+	nameplate string
+	secret    string
+	failures  int
+	pins      map[string]bool
+	ctrl      net.Conn
+	ctrlMu    sync.Mutex
+}
 
 func cmdDevice(args []string) error {
 	fs := flag.NewFlagSet("device", flag.ContinueOnError)
@@ -29,43 +47,82 @@ func cmdDevice(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if _, err := loadOrCreateKey(*state); err != nil {
+	key, err := loadOrCreateKey(*state)
+	if err != nil {
 		return err
 	}
 	id, err := deviceID(*state, *mode, *enroll)
 	if err != nil {
 		return err
 	}
-	code := ""
-	if *mode == "solo" {
-		code = newCode()
+	d := &deviceAgent{relayAddr: *relayAddr, adbd: *adbd, state: *state, mode: *mode, id: id, key: key,
+		pins: loadPins(*state)}
+	if d.mode == "solo" {
+		d.newCode()
 	}
 	announced := false
 	for {
-		err := deviceSession(*relayAddr, *adbd, id, code, &announced)
+		err := d.session(&announced)
 		fmt.Fprintln(os.Stderr, "device session ended:", err)
 		time.Sleep(time.Second)
 	}
 }
 
-func deviceSession(relayAddr, adbd, id, code string, announced *bool) error {
-	c, err := dial(relayAddr)
+func (d *deviceAgent) newCode() {
+	d.nameplate = randDigits(4)
+	d.secret = randDigits(6)
+	d.failures = 0
+}
+
+func (d *deviceAgent) emitCode() {
+	emit("pairing_code", map[string]any{"code": d.nameplate + "-" + d.secret, "device_id": d.id})
+}
+
+// rotateCode issues a fresh code and tells the relay the new nameplate.
+func (d *deviceAgent) rotateCode() {
+	d.newCode()
+	np := d.nameplate
+	d.emitCode()
+	d.ctrlMu.Lock()
+	if d.ctrl != nil {
+		writeHello(d.ctrl, hello{Role: "device", DeviceID: d.id, Code: np})
+	}
+	d.ctrlMu.Unlock()
+}
+
+func (d *deviceAgent) session(announced *bool) error {
+	c, err := dial(d.relayAddr)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
 	br := bufio.NewReader(c)
-	if err := writeHello(c, hello{Role: "device", DeviceID: id, Code: code}); err != nil {
+	d.mu.Lock()
+	np := d.nameplate
+	d.mu.Unlock()
+	if err := writeHello(c, hello{Role: "device", DeviceID: d.id, Code: np}); err != nil {
 		return err
 	}
 	var rep reply
 	if err := readHello(br, &rep); err != nil {
 		return err
 	}
+	if !rep.OK {
+		d.mu.Lock()
+		d.newCode()
+		d.mu.Unlock()
+		return fmt.Errorf("relay refused registration: %s", rep.Reason)
+	}
+	d.ctrlMu.Lock()
+	d.ctrl = c
+	d.ctrlMu.Unlock()
+	defer func() { d.ctrlMu.Lock(); d.ctrl = nil; d.ctrlMu.Unlock() }()
 	if !*announced {
-		emit("online", map[string]any{"device_id": id})
-		if code != "" {
-			emit("pairing_code", map[string]any{"code": code, "device_id": id})
+		emit("online", map[string]any{"device_id": d.id})
+		if d.mode == "solo" {
+			d.mu.Lock()
+			d.emitCode()
+			d.mu.Unlock()
 		}
 		*announced = true
 	}
@@ -75,33 +132,83 @@ func deviceSession(relayAddr, adbd, id, code string, announced *bool) error {
 			return err
 		}
 		if m.Open != "" {
-			go openData(relayAddr, adbd, m.Open)
+			go d.openData(m.Open)
 		}
 	}
 }
 
-func openData(relayAddr, adbd, sid string) {
-	a, err := dial(adbd)
-	if err != nil {
-		return
+func (d *deviceAgent) policy() responderPolicy {
+	return responderPolicy{
+		id: d.key,
+		pairing: func() (string, string, bool) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			return d.secret, d.nameplate, d.secret != "" && d.mode == "solo"
+		},
+		pairResult: func(ok bool, peer ed25519.PublicKey) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if ok {
+				d.pins[pinKey(peer)] = true
+				savePins(d.state, d.pins)
+				d.rotateCode() // a code is single-use
+				return
+			}
+			d.failures++
+			if d.failures >= maxPairFailures {
+				d.rotateCode() // burn after repeated failures
+			}
+		},
+		authorize: func(peer ed25519.PublicKey, token string) error {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if d.pins[pinKey(peer)] {
+				return nil
+			}
+			if d.mode == "corporate" {
+				return nil // TODO(exp): token-based authorization
+			}
+			return errDenied
+		},
 	}
-	c, err := dial(relayAddr)
+}
+
+func (d *deviceAgent) openData(sid string) {
+	c, err := dial(d.relayAddr)
 	if err != nil {
-		a.Close()
 		return
 	}
 	if err := writeHello(c, hello{Role: "data", SID: sid}); err != nil {
-		a.Close()
 		c.Close()
 		return
 	}
-	sc, err := handshake(c, c, false)
+	sc, _, err := serverHandshake(c, c, d.policy())
 	if err != nil {
-		a.Close()
+		c.Close()
+		return
+	}
+	a, err := dial(d.adbd) // adbd is only touched after authentication
+	if err != nil {
 		c.Close()
 		return
 	}
 	splice(sc, sc, a, a)
+}
+
+func pinKey(k ed25519.PublicKey) string { return base64.RawURLEncoding.EncodeToString(k) }
+
+func loadPins(state string) map[string]bool {
+	m := map[string]bool{}
+	b, err := os.ReadFile(filepath.Join(state, "peers.json"))
+	if err == nil {
+		json.Unmarshal(b, &m)
+	}
+	return m
+}
+
+func savePins(state string, m map[string]bool) {
+	b, _ := json.Marshal(m)
+	os.WriteFile(filepath.Join(state, "peers.json"), b, 0o600)
 }
 
 func deviceID(state, mode, enroll string) (string, error) {
@@ -128,7 +235,11 @@ func deviceID(state, mode, enroll string) (string, error) {
 	return id, os.WriteFile(p, []byte(id), 0o600)
 }
 
-func newCode() string {
-	n, _ := rand.Int(rand.Reader, big.NewInt(1_000_000))
-	return fmt.Sprintf("%06d", n.Int64())
+func randDigits(n int) string {
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		v, _ := rand.Int(rand.Reader, big.NewInt(10))
+		sb.WriteByte(byte('0' + v.Int64()))
+	}
+	return sb.String()
 }
