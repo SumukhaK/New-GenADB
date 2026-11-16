@@ -682,4 +682,146 @@ The links below are included so every major technical claim and every named repo
 
 ---
 
+---
+
+## 16. New-GenADB problem statement, design hypothesis and evaluation specification
+
+*Added 16 November 2026. This section is the research specification for the autoresearch loop: `program.md` refers to it in place of a separate `research_draft.md`.*
+
+### 16.1 Problem statement
+
+We are building a tool with three parts: a **desktop app with a CLI**, a **mobile companion app**, and a **connectivity core** that they share. With it, a developer can deploy to and debug their own physical Android phone from any IDE without a USB cable to the computer. The connectivity core comes first. The front end is out of scope for now.
+
+The tool has two modes.
+
+| | Solo / developer mode | Corporate mode |
+|---|---|---|
+| Who | Indie developers, freelancers, hobby projects on their own network and hardware | Organisations with USB data blocked, VPNs, MDM, security review |
+| Phone network | Same Wi-Fi as the computer, or mobile data (carrier NAT) | Anywhere. Corporate egress may allow only outbound HTTPS. |
+| Trust bootstrap | Short pairing code shown on the phone (cf. Wireless debugging) | IdP/SSO identity for users, MDM-issued enrollment for devices |
+| Security posture | Relaxed UX, but still encrypted end to end and resistant to brute force | Least privilege, no bearer-token-only access, revocation, audit, respects `DISALLOW_DEBUGGING_FEATURES` |
+
+Required capabilities:
+
+- Deploy APKs, and AABs via `bundletool install-apks`, which uses split install sessions (`install-multiple`).
+- Stream the deployed app's logs into the IDE's Logcat console.
+- Attach a debugger (JDWP).
+- Bonus: screenshots (`screencap`) and short screen recordings (`screenrecord`).
+
+### 16.2 Core design hypothesis: make the remote phone look like a local `adb connect` target
+
+Android Studio, the IntelliJ/VS Code Android tooling, Gradle `installDebug`, `bundletool` and scrcpy all talk to the **local adb server (port 5037)**. If the desktop agent exposes a loopback TCP endpoint that behaves like a phone's adbd, then `adb connect 127.0.0.1:<port>` registers the remote phone as an ordinary device. Every IDE feature then works unchanged: install, Logcat, debugger, screen capture and file transfer.
+
+So the connectivity core is a **secure, resilient byte tunnel for one long-lived adb transport stream**. adb multiplexes all of its services over that single TCP connection. The core does not need to re-implement any IDE feature. This is the same shape as the AndroidGradleTools relay family (§2) and the BigBlueWhale reverse tunnel (§3). It adds the policy, identity, integrity and lifecycle layer that §11 found missing.
+
+```text
+IDE / Gradle / bundletool / scrcpy
+        │ (adb client protocol, localhost:5037)
+local adb server ──adb connect 127.0.0.1:P──► genadb connect (desktop agent, loopback-only listener)
+                                                   │ outbound, end-to-end encrypted session
+                                                   ▼
+                                            genadb relay (rendezvous + policy + audit; sees ciphertext only)
+                                                   ▲ outbound (works behind carrier NAT)
+                                                   │
+                                   genadb device (inside the companion app on the phone)
+                                                   │ only after an authorised session exists
+                                                   ▼
+                                   phone adbd (Wireless debugging TLS port or legacy tcpip)
+```
+
+There is also an optional **direct LAN path**. When the phone and computer can reach each other, as in the solo same-Wi-Fi case, the agents should use a direct connection with the same end-to-end authentication, and fall back to the relay.
+
+### 16.3 Hard phone-side constraint (to verify on real hardware)
+
+A non-root app cannot create debugging authority. It can only forward to the system adbd. The options for reaching adbd are:
+
+1. **Wireless debugging TLS endpoint**, used as `127.0.0.1:<dynamic port>` from the companion. This is the cleanest option, because adb's own TLS and key pinning stay end to end between the developer's adb and the phone. It requires the phone to be associated with *some* Wi-Fi. Stock Android turns Wireless debugging off without Wi-Fi, and Android 17's "trusted networks" behaviour (§ report 2) can turn it off on unapproved networks. Because the port is dynamic, the companion must discover it (local mDNS `_adb-tls-connect._tcp`) and follow it when it changes. First-time `adb pair` can be carried through the tunnel to the pairing port.
+2. **Legacy `adb tcpip`**, bootstrapped once over USB, or Shizuku/LADB-style by having the companion pair with its own adbd. This survives Wi-Fi loss until reboot, so it is the only known non-root route for **mobile-data-only** solo use. adbd then listens in plaintext on all interfaces. That is acceptable only as an explicit solo-mode opt-in, with the tunnel providing the encryption and an automatic `usb:`/disable afterwards.
+3. **ADB-aware proxy**: the companion is itself an authorised adb client of its own adbd and proxies services. This is more complex and is a possible future research direction.
+
+None of these behaviours can be confirmed without physical devices across OEMs. Each is listed in §16.7 as unverified.
+
+### 16.4 Security design targets
+
+- **Solo mode:**
+  - Pairing uses a short code with a PAKE-style handshake, so neither the relay nor a network observer learns the code or can brute-force it offline.
+  - The code is burned after 3 failures.
+  - Long-term keys are pinned for later reconnects without a code.
+  - Traffic is encrypted and authenticated end to end, so the relay is blind and tampering is detected.
+- **Corporate mode:**
+  - Users present IdP-signed JWTs (EdDSA in the test IdP). The relay checks issuer, audience, expiry and signature, and the token must carry a `cnf.key` bound to the desktop agent's key (proof of possession), so a stolen token is useless.
+  - Devices enroll with MDM-signed tokens that also bind their key.
+  - The relay enforces per-user, per-device grants and supports admin revocation that kills live sessions.
+  - The relay writes an audit log without secrets.
+  - The device agent refuses to run when MDM disallows debugging, and touches adbd only for an authorised session.
+  - The desktop listener is loopback-only.
+
+### 16.5 Process contract (what eval.py drives)
+
+All roles are subcommands of one binary built from `core/` by `solution.py`. Each prints JSON-lines events on stdout.
+
+| Command | Required behaviour / events |
+|---|---|
+| `genadb keygen --state DIR` | Create (idempotent) the identity key and print `{"event":"pubkey","pubkey":S}`. `S` is opaque. It is placed in JWT `cnf.key`. |
+| `genadb relay --listen H:P --mode solo\|corporate [--policy F] [--audit F] [--admin H:P --admin-token T]` | Print `{"event":"ready"}`. The admin endpoint takes `POST /v1/revoke` with `{"user":U}` or `{"device":D}` and `Authorization: Bearer T`. It kills live sessions and denies new ones. The audit log is JSONL with `event`, `user`, `device`, and no secrets. |
+| `genadb device --relay H:P --adbd H:P --state DIR --mode M [--enroll JWT --policy F] [--debug-policy allowed\|disallowed] [--lan-listen H:P --lan-advertise H:P]` | Print `{"event":"online","device_id":D}`. In solo mode also print `{"event":"pairing_code","code":C,"device_id":D}`, and print a fresh code after a code is burned. If debugging is disallowed, print `{"event":"blocked",...}` and never contact adbd. |
+| `genadb connect --relay H:P --state DIR --listen 127.0.0.1:0 --mode M (--code C \| --device D) [--identity JWT] [--policy F]` | Print `{"event":"listening","addr":"127.0.0.1:N","device_id":D}` when ready. The harness then runs `adb connect`. On denial, print `{"event":"error"}` and exit non-zero. Printing `listening` and then refusing the adb connection is also accepted. |
+
+The policy file (corporate) contains `relay_id` (the expected JWT `aud`), `issuer`, `idp_ed25519_public_key` (raw, base64url), `grants: [{user, devices[]}]` and `max_session_seconds`. JWT claims are `iss`, `sub`, `aud`, `typ` (`user`|`device`), `iat`, `nbf`, `exp`, `jti` and `cnf.key`.
+
+### 16.6 Evaluation: test bed, scenarios and metric
+
+**Test bed.**
+
+- **Real adb host:** the **real AOSP `adb` host binary** (Ubuntu `adb` 34.0.4), one isolated server per scenario.
+- **Simulated phone:** `harness/fake_adbd.py`, a simulated phone adbd that speaks the real ADB wire protocol in two modes: Wireless-debugging TLS (STLS, TLS 1.3, client-key pinning) and legacy RSA AUTH. It implements shell/exec, sync push/pull, streamed install, split install sessions (`install-create/write/commit`, the bundletool/AAB path), logcat, screencap, a screenrecord stream and JDWP echo. It records everything it receives, so integrity is checked by hash.
+- **Network simulator:** `harness/netsim.py` sits on every agent↔relay leg. It adds latency and bandwidth caps and records all bytes. It can kill connections, black out the network, and flip one bit (active tampering).
+- **NAT model:** the agents can only dial out, which models NAT.
+
+**Scenarios** run in parallel, about 16 s in total:
+
+| ID | Setting | Checks (weight) |
+|---|---|---|
+| S | Solo, legacy adbd, 20 ms per leg one-way, 200 Mbit/s | pair+connect (3), shell (2), 8 MiB push+pull integrity (5), `adb install` (4), `install-multiple` / AAB path (3), screencap (3), logcat stream (3), screenrecord stream (2), JDWP debugger (2), reconnect without code (1); canary/file/shell output absent from the wire (4), pairing code absent from the wire (2), pushing zeros yields incompressible wire bytes (1) |
+| W | Solo, pairing abuse | 3 wrong codes rejected without touching adbd (2), correct code refused after 3 failures (4), freshly issued code works (1) |
+| T | Solo, legacy adbd, 10 ms per leg | a bit flip mid-pull is never accepted silently (8), a 12 MiB push survives a mid-transfer connection drop (5, or 0.4 if it only recovers), recovery time after a 4 s blackout (5) |
+| C | Corporate, TLS adbd, IdP + policy + audit + admin | authorised session works: shell, push, logcat (6, and gates the rest); deny unauthorised user / expired / forged / wrong audience / stolen token (other key) / no identity (2 each); `debug-policy disallowed` blocks without touching adbd (3); revoke kills the live session within seconds (2) and blocks new ones (2); audit log has start/deny/end and no secrets (3); loopback-only listeners and no adbd contact before authorisation (2) |
+| P | Measured inside S | push throughput, log-scaled 0.5→60 MB/s (3); time to ready (2); logcat median latency (2) |
+| L | Solo, relay legs 60 ms one-way, LAN path 1 ms available | JDWP median round-trip time, 250 ms → 20 ms scaled (3) |
+
+**SCORE** = Σ weight × fraction, with a range of 0 to 100 where higher is better. A denial only scores if the authorised session in the same scenario works, so "deny everything" earns nothing. A "denied" result requires both that adb never reaches `device` state and that the simulated adbd sees no new connection. The canary, payloads and seeds are random on every run. Measured run-to-run noise on the baseline is about ±0.05.
+
+**Anti-gaming rules**, enforced in `program.md` and by review:
+
+- The solution must not read `harness/` or `eval.py`, and must not detect the test environment.
+- Keys must not be derivable from data the relay sees.
+- The pairing code must not reach the relay in any encoding.
+- No hard-coded keys.
+
+### 16.7 What this evaluation can and cannot verify
+
+**Verified here:**
+
+- Real adb host behaviour (connect, TLS client authentication, install, split install, sync, logcat, exec-out, forward to JDWP) through the tunnel.
+- Protocol correctness and integrity under latency, drops, blackouts and bit flips.
+- Relay blindness against passive capture.
+- Corporate authorisation logic, revocation and audit.
+- Behaviour of the CLI process contract.
+
+**Not verified here. This needs physical devices and real networks:**
+
+- Real phone adbd behaviour: dynamic-port changes, Wireless debugging turning off when Wi-Fi drops, Android 17 trusted networks, OEM differences, and whether legacy tcpip mode survives on mobile data.
+- `adb pair` (SPAKE2) through the tunnel.
+- Android background-execution and battery limits on the companion's foreground service.
+- Real carrier NAT and IPv6 exposure.
+- Corporate egress proxies, i.e. WSS over 443.
+- MDM integration (reading `DISALLOW_DEBUGGING_FEATURES` from DevicePolicyManager).
+- The Android Studio UI itself.
+- `bundletool` with a real AAB. The eval tests the split-install path that bundletool uses.
+- Real screenrecord and H.264.
+
+Passive-capture checks cannot prove the absence of a weak cipher. Code review must confirm that standard AEAD and key exchange are used.
+
+---
+
 *End of report.*

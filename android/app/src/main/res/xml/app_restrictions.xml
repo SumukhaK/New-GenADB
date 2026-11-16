@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<restrictions xmlns:android="http://schemas.android.com/apk/res/android">
+    <restriction android:key="relay_url" android:restrictionType="string"
+        android:title="@string/r_relay_url" android:defaultValue="" />
+    <restriction android:key="enroll_token" android:restrictionType="string"
+        android:title="@string/r_enroll_token" android:defaultValue="" />
+    <restriction android:key="policy_json" android:restrictionType="string"
+        android:title="@string/r_policy_json" android:defaultValue="" />
+    <restriction android:key="relay_pin" android:restrictionType="string"
+        android:title="@string/r_relay_pin" android:defaultValue="" />
+</restrictions>

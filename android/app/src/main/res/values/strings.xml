@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="r_relay_url">Relay URL (wss://…)</string>
+    <string name="r_enroll_token">Device enrollment token (JWT)</string>
+    <string name="r_policy_json">Relay policy (JSON)</string>
+    <string name="r_relay_pin">Relay certificate SHA-256 pin</string>
+</resources>

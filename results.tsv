@@ -1,0 +1,17 @@
+commit_hash	iteration	score	status	hypothesis_summary
+b36c7eb	0	50.406660	BASELINE	plain TCP relay splice, cleartext pairing code, no E2E, no corporate policy
+62d88f8	1	63.365155	KEEP	AES-256-GCM E2E tunnel over ephemeral X25519 (unauthenticated DH) -> no plaintext, tamper detected [device: not run]
+6e9cdeb	2	62.387383	DISCARD	SPAKE2 pairing + signed AKE + pinning + burn: solo checks all pass but corporate session broke (pins required) [device: not run]
+189603d	3	70.357118	KEEP	SPAKE2 pairing (nameplate public, secret never on wire), Ed25519-signed X25519 AKE, key pinning, burn-after-3, single-use codes, adbd touched only after auth [device: not run, Go missing on PC]
+dd0aa26	4	92.363297	KEEP	corporate: EdDSA JWT (iss/aud/exp/typ) + cnf-bound PoP challenge at relay, device re-verifies user token+grant, desktop verifies device enrollment, MDM debug block, admin revoke kills sessions, JSONL audit [device: not run, Go missing on PC]
+ddd7fb1	5	95.260587	KEEP	solo direct LAN path (device advertises endpoint via relay; desktop tries direct with same AKE, falls back to relay): JDWP RTT 242ms -> 3ms [device: not run, Go missing on PC]
+64dfff1	6	97.771663	KEEP	resumable tunnel: offset/ack retransmit buffer + HMAC-authenticated rejoin with fresh per-epoch AEAD keys; 12MiB push survives drop, tampered frame is resent intact [device: not run, Go missing on PC]
+a691c32	7	98.253314	KEEP	cap rejoin backoff ~400-800ms: tunnel resumes right after a 4s blackout [device: not run, Go missing on PC]
+bba054b	8	98.973711	KEEP	ADB-aware split flow control (local WRTE acks + paced delivery, plaintext adbd only, passthrough on STLS/delayed_ack): push 5.7->11.7 MB/s, logcat latency 86->44ms [device: not run, Go missing on PC]
+2fa124a	9	98.982365	DISCARD	256KiB AEAD frames: +0.01, within noise; push is RTT/link bound (3 unspoofable RTTs + 25MB/s link cap) [device: not run]
+5e2aa59	10	98.967805	KEEP	Milestone B+C: ws/wss relay transport + CONNECT proxy + relay rate limiting; no regression (tests/transport_e2e.py PASS: ws 98.83, wss 98.74, wss+proxy 98.67) [device: pending]
+b24391e	11	98.982106	KEEP	Milestone C: mDNS discovery/tracking of the dynamic Wireless-debugging port (--adbd auto) + go unit tests; no regression [device: pending]
+d60bdb2	12	98.970892	KEEP	Milestone D: Android companion scaffold (agent-protocol JVM tests 3/3; app module unbuilt, no SDK here); no regression [device: pending]
+0fd6984	13	98.982252	KEEP	Milestone A fix: unknown-session rejoin is terminal, new adb conns held up to 15s while device restarts, stderr diagnostics; eval no regression, go test ok [device: pending verify]
+4297234	14	98.976754	KEEP	device agent waits up to 12s for adbd before dropping an authenticated session (real-world quirk: dozing phone Wi-Fi); eval no regression [device @030c748: PASS relay+LAN - shell, 1MiB push/pull SHA ok, 10MiB 669ms vs 587ms direct, reconnect after device-agent restart recovers with no manual step]
+b5f4b31	15	98.981852	KEEP	adbd wait capped at 7s (2s dials) and establish wait at 8s, inside adb's ~10s CNXN timeout, so a dozing phone gives a clean close instead of a zombie transport; eval no regression [device @d92afe1: PASS relay+LAN, 7 of 8 ungated runs pass, reconnect auto 3-32s; 1 first-connect doze left adb offline -> this fix] [device @f9f11ce: PASS 8/8 runs relay+LAN; first-connect doze now self-heals in 17-30s, no zombie]
