@@ -6,3 +6,4 @@ b36c7eb	0	50.406660	BASELINE	plain TCP relay splice, cleartext pairing code, no 
 dd0aa26	4	92.363297	KEEP	corporate: EdDSA JWT (iss/aud/exp/typ) + cnf-bound PoP challenge at relay, device re-verifies user token+grant, desktop verifies device enrollment, MDM debug block, admin revoke kills sessions, JSONL audit [device: not run, Go missing on PC]
 ddd7fb1	5	95.260587	KEEP	solo direct LAN path (device advertises endpoint via relay; desktop tries direct with same AKE, falls back to relay): JDWP RTT 242ms -> 3ms [device: not run, Go missing on PC]
 64dfff1	6	97.771663	KEEP	resumable tunnel: offset/ack retransmit buffer + HMAC-authenticated rejoin with fresh per-epoch AEAD keys; 12MiB push survives drop, tampered frame is resent intact [device: not run, Go missing on PC]
+a691c32	7	98.253314	KEEP	cap rejoin backoff ~400-800ms: tunnel resumes right after a 4s blackout [device: not run, Go missing on PC]
