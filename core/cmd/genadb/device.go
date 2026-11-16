@@ -30,6 +30,8 @@ type deviceAgent struct {
 	pins      map[string]bool
 	ctrl      net.Conn
 	ctrlMu    sync.Mutex
+	pol       *policy
+	token     string
 }
 
 func cmdDevice(args []string) error {
@@ -40,12 +42,17 @@ func cmdDevice(args []string) error {
 	mode := fs.String("mode", "solo", "solo|corporate")
 	fs.String("name", "", "device name")
 	enroll := fs.String("enroll", "", "device enrollment JWT (corporate)")
-	fs.String("policy", "", "policy file (corporate)")
-	fs.String("debug-policy", "allowed", "allowed|disallowed (MDM DISALLOW_DEBUGGING_FEATURES)")
+	policyPath := fs.String("policy", "", "policy file (corporate)")
+	debugPolicy := fs.String("debug-policy", "allowed", "allowed|disallowed (MDM DISALLOW_DEBUGGING_FEATURES)")
 	fs.String("lan-listen", "", "LAN listen address")
 	fs.String("lan-advertise", "", "LAN advertised address")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *debugPolicy != "allowed" {
+		// MDM has disabled debugging features: never offer a tunnel to adbd.
+		emit("blocked", map[string]any{"reason": "debugging_disallowed"})
+		select {} // stay visible to the UI but do nothing
 	}
 	key, err := loadOrCreateKey(*state)
 	if err != nil {
@@ -56,7 +63,15 @@ func cmdDevice(args []string) error {
 		return err
 	}
 	d := &deviceAgent{relayAddr: *relayAddr, adbd: *adbd, state: *state, mode: *mode, id: id, key: key,
-		pins: loadPins(*state)}
+		pins: loadPins(*state), token: *enroll}
+	if d.mode == "corporate" {
+		if d.pol, err = loadPolicy(*policyPath); err != nil {
+			return err
+		}
+		if _, err := d.pol.verifyToken(*enroll, "device", key.Public().(ed25519.PublicKey)); err != nil {
+			return fmt.Errorf("enrollment token: %w", err)
+		}
+	}
 	if d.mode == "solo" {
 		d.newCode()
 	}
@@ -100,11 +115,8 @@ func (d *deviceAgent) session(announced *bool) error {
 	d.mu.Lock()
 	np := d.nameplate
 	d.mu.Unlock()
-	if err := writeHello(c, hello{Role: "device", DeviceID: d.id, Code: np}); err != nil {
-		return err
-	}
-	var rep reply
-	if err := readHello(br, &rep); err != nil {
+	rep, err := relayHello(c, br, hello{Role: "device", DeviceID: d.id, Code: np, Identity: d.token}, d.key)
+	if err != nil {
 		return err
 	}
 	if !rep.OK {
@@ -139,7 +151,8 @@ func (d *deviceAgent) session(announced *bool) error {
 
 func (d *deviceAgent) policy() responderPolicy {
 	return responderPolicy{
-		id: d.key,
+		id:    d.key,
+		token: d.token,
 		pairing: func() (string, string, bool) {
 			d.mu.Lock()
 			defer d.mu.Unlock()
@@ -166,7 +179,16 @@ func (d *deviceAgent) policy() responderPolicy {
 				return nil
 			}
 			if d.mode == "corporate" {
-				return nil // TODO(exp): token-based authorization
+				// defence in depth: the device re-checks the user's token,
+				// its binding to the peer key and the grant itself.
+				cl, err := d.pol.verifyToken(token, "user", peer)
+				if err != nil {
+					return err
+				}
+				if !d.pol.granted(cl.Sub, d.id) {
+					return errDenied
+				}
+				return nil
 			}
 			return errDenied
 		},

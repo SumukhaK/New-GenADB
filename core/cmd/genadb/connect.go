@@ -13,8 +13,8 @@ import (
 )
 
 type desktopAgent struct {
-	relayAddr, state string
-	key              ed25519.PrivateKey
+	relayAddr, state, token string
+	key                     ed25519.PrivateKey
 }
 
 func cmdConnect(args []string) error {
@@ -25,8 +25,8 @@ func cmdConnect(args []string) error {
 	mode := fs.String("mode", "solo", "solo|corporate")
 	code := fs.String("code", "", "pairing code shown on the phone (NNNN-SSSSSS)")
 	device := fs.String("device", "", "previously paired device id")
-	fs.String("identity", "", "user identity JWT (corporate)")
-	fs.String("policy", "", "policy file (corporate)")
+	identity := fs.String("identity", "", "user identity JWT (corporate)")
+	policyPath := fs.String("policy", "", "policy file (corporate)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -34,7 +34,32 @@ func cmdConnect(args []string) error {
 	if err != nil {
 		return err
 	}
-	a := &desktopAgent{relayAddr: *relayAddr, state: *state, key: key}
+	a := &desktopAgent{relayAddr: *relayAddr, state: *state, key: key, token: *identity}
+	params := initiatorParams{id: key, mode: "resume", token: *identity}
+	if *mode == "corporate" {
+		if *identity == "" {
+			return fmt.Errorf("%w: corporate mode requires --identity", errDenied)
+		}
+		pol, err := loadPolicy(*policyPath)
+		if err != nil {
+			return err
+		}
+		if *device == "" {
+			return fmt.Errorf("corporate mode requires --device")
+		}
+		want := *device
+		// the device must prove an MDM enrollment bound to the key it uses
+		params.verifyPeer = func(peer ed25519.PublicKey, tok string) error {
+			cl, err := pol.verifyToken(tok, "device", peer)
+			if err != nil {
+				return fmt.Errorf("device enrollment: %w", err)
+			}
+			if cl.Sub != want {
+				return fmt.Errorf("device enrollment is for %q, not %q", cl.Sub, want)
+			}
+			return nil
+		}
+	}
 	id := *device
 	if *code != "" {
 		np, secret, ok := strings.Cut(*code, "-")
@@ -55,16 +80,19 @@ func cmdConnect(args []string) error {
 		}
 		id = did
 	}
-	pinned, err := loadPeer(*state, id)
-	if err != nil && *mode != "corporate" {
-		return fmt.Errorf("%w: device %q is not paired with this computer", errDenied, id)
+	if *mode != "corporate" {
+		pinned, err := loadPeer(*state, id)
+		if err != nil {
+			return fmt.Errorf("%w: device %q is not paired with this computer", errDenied, id)
+		}
+		params.pinnedPeer = pinned
 	}
 	// verify the device is reachable and still trusts us before exposing a port
 	c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
 	if err != nil {
 		return err
 	}
-	_, _, err = clientHandshake(c, br, initiatorParams{id: key, mode: "resume", pinnedPeer: pinned})
+	_, _, err = clientHandshake(c, br, params)
 	c.Close()
 	if err != nil {
 		return fmt.Errorf("%w: %v", errDenied, err)
@@ -85,7 +113,7 @@ func cmdConnect(args []string) error {
 				conn.Close()
 				return
 			}
-			sc, _, err := clientHandshake(c, br, initiatorParams{id: key, mode: "resume", pinnedPeer: pinned})
+			sc, _, err := clientHandshake(c, br, params)
 			if err != nil {
 				conn.Close()
 				c.Close()
@@ -103,12 +131,9 @@ func (a *desktopAgent) openSession(h hello) (net.Conn, *bufio.Reader, string, er
 		return nil, nil, "", err
 	}
 	br := bufio.NewReader(c)
-	if err := writeHello(c, h); err != nil {
-		c.Close()
-		return nil, nil, "", err
-	}
-	var rep reply
-	if err := readHello(br, &rep); err != nil {
+	h.Identity = a.token
+	rep, err := relayHello(c, br, h, a.key)
+	if err != nil {
 		c.Close()
 		return nil, nil, "", err
 	}

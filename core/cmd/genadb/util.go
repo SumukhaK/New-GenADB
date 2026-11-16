@@ -99,3 +99,29 @@ func dial(addr string) (net.Conn, error) {
 }
 
 var errDenied = errors.New("denied")
+
+// relayHello sends a hello to the relay and completes the corporate
+// proof-of-possession challenge if the relay asks for one.
+func relayHello(c net.Conn, br *bufio.Reader, h hello, key ed25519.PrivateKey) (reply, error) {
+	if h.Identity != "" {
+		h.Pub = pubString(key)
+	}
+	if err := writeHello(c, h); err != nil {
+		return reply{}, err
+	}
+	var rep reply
+	if err := readHello(br, &rep); err != nil {
+		return reply{}, err
+	}
+	if rep.OK && len(rep.Challenge) > 0 {
+		sig := ed25519.Sign(key, popMessage(rep.Challenge, h.Identity))
+		if err := writeHello(c, hello{Sig: sig}); err != nil {
+			return reply{}, err
+		}
+		rep = reply{}
+		if err := readHello(br, &rep); err != nil {
+			return reply{}, err
+		}
+	}
+	return rep, nil
+}
