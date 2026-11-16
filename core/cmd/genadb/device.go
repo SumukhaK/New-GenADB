@@ -357,9 +357,12 @@ func randDigits(n int) string {
 
 // adbdWait bounds how long an authenticated session waits for adbd to become
 // reachable (a dozing radio or adbd restarting after a Wireless-debugging
-// toggle) before giving up. It stays under adb's own 10 s connect timeout
-// budget for the common case of a single slow attempt.
-const adbdWait = 12 * time.Second
+// toggle) before giving up. adb abandons a transport whose CNXN is unanswered after
+// about 10 s, so the whole wait must finish well inside that.
+const (
+	adbdWait        = 7 * time.Second
+	adbdDialTimeout = 2 * time.Second
+)
 
 func (d *deviceAgent) dialAdbdPatiently() (net.Conn, error) {
 	deadline := time.Now().Add(adbdWait)
@@ -371,7 +374,7 @@ func (d *deviceAgent) dialAdbdPatiently() (net.Conn, error) {
 			}
 			return c, nil
 		}
-		if time.Now().After(deadline) {
+		if time.Now().Add(adbdDialTimeout + 300*time.Millisecond).After(deadline) {
 			return nil, err
 		}
 		if attempt == 1 {
@@ -388,7 +391,7 @@ func (d *deviceAgent) dialAdbd() (net.Conn, error) {
 	addr, err := d.adbd.current()
 	if err == nil {
 		var c net.Conn
-		if c, err = dial(addr); err == nil {
+		if c, err = dialTimeout(addr, adbdDialTimeout); err == nil {
 			return c, nil
 		}
 	}
@@ -399,5 +402,5 @@ func (d *deviceAgent) dialAdbd() (net.Conn, error) {
 		}
 		return nil, err
 	}
-	return dial(addr)
+	return dialTimeout(addr, adbdDialTimeout)
 }

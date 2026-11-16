@@ -88,8 +88,10 @@ func closeWrite(c net.Conn) {
 	}
 }
 
-func dial(addr string) (net.Conn, error) {
-	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+func dial(addr string) (net.Conn, error) { return dialTimeout(addr, 5*time.Second) }
+
+func dialTimeout(addr string, d time.Duration) (net.Conn, error) {
+	c, err := net.DialTimeout("tcp", addr, d)
 	if err != nil {
 		return nil, err
 	}

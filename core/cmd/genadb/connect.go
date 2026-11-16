@@ -129,7 +129,7 @@ func cmdConnect(args []string) error {
 // keeps reconnecting a dropped tcp transport; holding its socket until the
 // device is back turns that reconnect into a success instead of a burned
 // attempt. Denials are never retried.
-const establishWait = 15 * time.Second
+const establishWait = 8 * time.Second
 
 func (a *desktopAgent) establishPatiently(id, lan string, params initiatorParams) (*secureConn, error) {
 	deadline := time.Now().Add(establishWait)
