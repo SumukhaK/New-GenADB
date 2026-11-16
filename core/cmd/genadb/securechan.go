@@ -24,6 +24,9 @@ type secureConn struct {
 	recvCtr uint64
 	wmu     sync.Mutex
 	rbuf    []byte
+
+	sid       []byte // session id (for resumption)
+	resumeKey []byte // secret used to authenticate a rejoin
 }
 
 func newAEAD(key []byte) cipher.AEAD {
@@ -93,4 +96,30 @@ func (s *secureConn) Read(p []byte) (int, error) {
 	n := copy(p, s.rbuf)
 	s.rbuf = s.rbuf[n:]
 	return n, nil
+}
+
+// ReadRecord reads exactly one decrypted frame into buf.
+func (s *secureConn) ReadRecord(buf []byte) (int, error) {
+	if len(s.rbuf) > 0 {
+		return 0, errors.New("mixed read modes")
+	}
+	var hdr [4]byte
+	if _, err := io.ReadFull(s.r, hdr[:]); err != nil {
+		return 0, err
+	}
+	ln := binary.BigEndian.Uint32(hdr[:])
+	if ln > maxFrame+64 || ln < uint32(s.recvA.Overhead()) {
+		return 0, errors.New("bad frame length")
+	}
+	ct := make([]byte, ln)
+	if _, err := io.ReadFull(s.r, ct); err != nil {
+		return 0, err
+	}
+	pt, err := s.recvA.Open(ct[:0], nonce(s.recvCtr), ct, hdr[:])
+	if err != nil {
+		s.Conn.Close()
+		return 0, errors.New("frame authentication failed")
+	}
+	s.recvCtr++
+	return copy(buf, pt), nil
 }

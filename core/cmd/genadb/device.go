@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -33,6 +34,7 @@ type deviceAgent struct {
 	pol       *policy
 	token     string
 	lan       string
+	tunnels   map[string]*tunnel
 }
 
 // serveLAN accepts direct connections from desktops on the same network.
@@ -79,7 +81,7 @@ func cmdDevice(args []string) error {
 		return err
 	}
 	d := &deviceAgent{relayAddr: *relayAddr, adbd: *adbd, state: *state, mode: *mode, id: id, key: key,
-		pins: loadPins(*state), token: *enroll}
+		pins: loadPins(*state), token: *enroll, tunnels: map[string]*tunnel{}}
 	if d.mode == "corporate" {
 		if d.pol, err = loadPolicy(*policyPath); err != nil {
 			return err
@@ -235,7 +237,22 @@ func (d *deviceAgent) openData(sid string) {
 }
 
 func (d *deviceAgent) serveStream(c net.Conn) {
-	sc, _, err := serverHandshake(c, c, d.policy())
+	var m1 hsMsg
+	c.SetReadDeadline(time.Now().Add(15 * time.Second))
+	b1, err := readMsg(c, &m1)
+	c.SetReadDeadline(time.Time{})
+	if err != nil {
+		c.Close()
+		return
+	}
+	if m1.Mode == "rejoin" {
+		var rj rejoinMsg
+		if json.Unmarshal(b1, &rj) != nil || serverRejoin(c, c, rj, d.lookupTunnel) != nil {
+			c.Close()
+		}
+		return
+	}
+	sc, _, err := serverHandshake(c, c, d.policy(), b1, m1)
 	if err != nil {
 		c.Close()
 		return
@@ -245,7 +262,21 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		c.Close()
 		return
 	}
-	splice(sc, sc, a, a)
+	t := newTunnel(sc, a, false)
+	key := hex.EncodeToString(t.sid)
+	d.mu.Lock()
+	d.tunnels[key] = t
+	d.mu.Unlock()
+	t.run(nil)
+	d.mu.Lock()
+	delete(d.tunnels, key)
+	d.mu.Unlock()
+}
+
+func (d *deviceAgent) lookupTunnel(sid string) *tunnel {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.tunnels[sid]
 }
 
 func pinKey(k ed25519.PublicKey) string { return base64.RawURLEncoding.EncodeToString(k) }

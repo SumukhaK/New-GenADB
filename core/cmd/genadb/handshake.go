@@ -82,16 +82,16 @@ func mac(key []byte, label string, th []byte) []byte {
 	return m.Sum(nil)
 }
 
-type keys struct{ i2r, r2i, confirm []byte }
+type keys struct{ i2r, r2i, confirm, resume, sid []byte }
 
 func deriveKeys(dh, pakeK, th []byte) keys {
 	secret := append(append([]byte{}, dh...), pakeK...)
-	k, _ := hkdf.Key(sha256.New, secret, th, "genadb session keys v1", 96)
-	return keys{k[:32], k[32:64], k[64:]}
+	k, _ := hkdf.Key(sha256.New, secret, th, "genadb session keys v1", 144)
+	return keys{k[:32], k[32:64], k[64:96], k[96:128], k[128:144]}
 }
 
 func makeSecure(c net.Conn, r io.Reader, k keys, initiator bool) *secureConn {
-	s := &secureConn{Conn: c, r: r}
+	s := &secureConn{Conn: c, r: r, sid: k.sid, resumeKey: k.resume}
 	if initiator {
 		s.sendA, s.recvA = newAEAD(k.i2r), newAEAD(k.r2i)
 	} else {
@@ -201,14 +201,10 @@ type responderPolicy struct {
 	token     string // device's own token (corporate)
 }
 
-func serverHandshake(c net.Conn, r io.Reader, p responderPolicy) (*secureConn, ed25519.PublicKey, error) {
+func serverHandshake(c net.Conn, r io.Reader, p responderPolicy, b1 []byte, m1 hsMsg) (*secureConn, ed25519.PublicKey, error) {
 	c.SetDeadline(time.Now().Add(15 * time.Second))
 	defer c.SetDeadline(time.Time{})
-	var m1 hsMsg
-	b1, err := readMsg(r, &m1)
-	if err != nil {
-		return nil, nil, err
-	}
+	var err error
 	if len(m1.ID) != ed25519.PublicKeySize {
 		return nil, nil, errors.New("bad peer identity")
 	}

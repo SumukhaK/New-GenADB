@@ -110,33 +110,61 @@ func cmdConnect(args []string) error {
 			return err
 		}
 		go func(conn net.Conn) {
-			// prefer a direct LAN path (same handshake, same keys policy)
-			if lan != "" {
-				if dc, err := net.DialTimeout("tcp", lan, 700*time.Millisecond); err == nil {
-					if tc, ok := dc.(*net.TCPConn); ok {
-						tc.SetNoDelay(true)
-					}
-					if sc, _, err := clientHandshake(dc, dc, params); err == nil {
-						splice(conn, conn, sc, sc)
-						return
-					}
-					dc.Close()
-				}
-			}
-			c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
+			sc, err := a.establish(id, lan, params)
 			if err != nil {
 				conn.Close()
 				return
 			}
-			sc, _, err := clientHandshake(c, br, params)
-			if err != nil {
-				conn.Close()
-				c.Close()
-				return
-			}
-			splice(conn, conn, sc, sc)
+			t := newTunnel(sc, conn, true)
+			t.run(func(t *tunnel) error { return a.rejoin(id, lan, t) })
 		}(conn)
 	}
+}
+
+// establish opens a new authenticated stream, preferring the direct LAN path.
+func (a *desktopAgent) establish(id, lan string, params initiatorParams) (*secureConn, error) {
+	if lan != "" {
+		if dc, err := net.DialTimeout("tcp", lan, 700*time.Millisecond); err == nil {
+			if tc, ok := dc.(*net.TCPConn); ok {
+				tc.SetNoDelay(true)
+			}
+			if sc, _, err := clientHandshake(dc, dc, params); err == nil {
+				return sc, nil
+			}
+			dc.Close()
+		}
+	}
+	c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
+	if err != nil {
+		return nil, err
+	}
+	sc, _, err := clientHandshake(c, br, params)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	return sc, nil
+}
+
+// rejoin re-attaches an existing tunnel after the underlying path broke.
+func (a *desktopAgent) rejoin(id, lan string, t *tunnel) error {
+	if lan != "" {
+		if dc, err := net.DialTimeout("tcp", lan, 700*time.Millisecond); err == nil {
+			if err := clientRejoin(dc, dc, t); err == nil {
+				return nil
+			}
+			dc.Close()
+		}
+	}
+	c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
+	if err != nil {
+		return err
+	}
+	if err := clientRejoin(c, br, t); err != nil {
+		c.Close()
+		return err
+	}
+	return nil
 }
 
 func (a *desktopAgent) openSession(h hello) (net.Conn, *bufio.Reader, string, error) {
@@ -159,6 +187,10 @@ func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, 
 	}
 	if !rep.OK {
 		c.Close()
+		switch rep.Reason {
+		case "device offline", "unknown device or code", "device did not answer":
+			return nil, nil, reply{}, fmt.Errorf("device unavailable: %s", rep.Reason)
+		}
 		return nil, nil, reply{}, fmt.Errorf("%w: %s", errDenied, rep.Reason)
 	}
 	return c, br, rep, nil
