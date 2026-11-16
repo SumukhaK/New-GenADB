@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -170,14 +171,22 @@ func (t *tunnel) run(reconnect func(t *tunnel) error) {
 			continue
 		}
 		backoff := 100 * time.Millisecond
-		for {
+		started := time.Now()
+		for attempt := 1; ; attempt++ {
 			err := reconnect(t)
 			if err == nil {
+				if attempt > 1 {
+					logf("tunnel resumed after %s (%d attempts)", time.Since(started).Round(time.Millisecond), attempt)
+				}
 				break
 			}
 			if errors.Is(err, errDenied) || time.Now().After(deadline) {
+				logf("tunnel closed, cannot resume: %v", err)
 				t.close()
 				return
+			}
+			if attempt == 1 {
+				logf("tunnel path broke; resuming (%v)", err)
 			}
 			time.Sleep(backoff)
 			if backoff < 400*time.Millisecond {
@@ -372,7 +381,10 @@ func clientRejoin(c net.Conn, r io.Reader, t *tunnel) error {
 		return err
 	}
 	if rep.Err != "" {
-		return errDenied
+		// The peer answered but has no such session (e.g. the device agent
+		// restarted and its adbd connection died with it). Resuming is
+		// impossible, so fail fast: closing adb's socket lets adb reconnect.
+		return fmt.Errorf("%w: rejoin refused: %s", errDenied, rep.Err)
 	}
 	if !hmac.Equal(rep.MAC, rejoinMAC(t.resumeKey, "rejoin-r", sid, rep.Nonce, rep.Recv, n1)) {
 		return errors.New("rejoin authentication failed")

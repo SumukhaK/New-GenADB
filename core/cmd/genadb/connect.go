@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -111,14 +112,46 @@ func cmdConnect(args []string) error {
 			return err
 		}
 		go func(conn net.Conn) {
-			sc, err := a.establish(id, lan, params)
+			sc, err := a.establishPatiently(id, lan, params)
 			if err != nil {
+				logf("adb connection from %s refused: %v", conn.RemoteAddr(), err)
 				conn.Close()
 				return
 			}
 			t := newTunnel(sc, accelerate(conn), true)
 			t.run(func(t *tunnel) error { return a.rejoin(id, lan, t) })
 		}(conn)
+	}
+}
+
+// establishWait bounds how long a fresh adb connection is held open while the
+// device is transiently unreachable (agent restarting, phone roaming). adb
+// keeps reconnecting a dropped tcp transport; holding its socket until the
+// device is back turns that reconnect into a success instead of a burned
+// attempt. Denials are never retried.
+const establishWait = 15 * time.Second
+
+func (a *desktopAgent) establishPatiently(id, lan string, params initiatorParams) (*secureConn, error) {
+	deadline := time.Now().Add(establishWait)
+	backoff := 200 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		sc, err := a.establish(id, lan, params)
+		if err == nil {
+			if attempt > 1 {
+				logf("session established after %d attempts", attempt)
+			}
+			return sc, nil
+		}
+		if errors.Is(err, errDenied) || time.Now().Add(backoff).After(deadline) {
+			return nil, err
+		}
+		if attempt == 1 {
+			logf("device not reachable yet (%v); retrying for up to %s", err, establishWait)
+		}
+		time.Sleep(backoff)
+		if backoff < time.Second {
+			backoff *= 2
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -124,4 +125,12 @@ func relayHello(c net.Conn, br *bufio.Reader, h hello, key ed25519.PrivateKey) (
 		}
 	}
 	return rep, nil
+}
+
+// logf writes a timestamped diagnostic line to stderr. Events for machines go
+// to stdout via emit; this is for humans debugging a field failure.
+func logf(format string, args ...any) {
+	emitMu.Lock()
+	fmt.Fprintf(os.Stderr, "%s genadb: %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))
+	emitMu.Unlock()
 }

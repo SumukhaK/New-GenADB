@@ -109,7 +109,7 @@ func cmdDevice(args []string) error {
 	announced := false
 	for {
 		err := d.session(&announced)
-		fmt.Fprintln(os.Stderr, "device session ended:", err)
+		logf("relay session ended: %v; reconnecting", err)
 		time.Sleep(time.Second)
 	}
 }
@@ -267,18 +267,23 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 	}
 	if m1.Mode == "rejoin" {
 		var rj rejoinMsg
-		if json.Unmarshal(b1, &rj) != nil || serverRejoin(c, c, rj, d.lookupTunnel) != nil {
+		if json.Unmarshal(b1, &rj) != nil {
+			c.Close()
+		} else if err := serverRejoin(c, c, rj, d.lookupTunnel); err != nil {
+			logf("rejoin refused: %v", err)
 			c.Close()
 		}
 		return
 	}
 	sc, _, err := serverHandshake(c, c, d.policy(), b1, m1)
 	if err != nil {
+		logf("handshake failed: %v", err)
 		c.Close()
 		return
 	}
 	a, err := d.dialAdbd() // adbd is only touched after authentication
 	if err != nil {
+		logf("adbd unreachable: %v", err)
 		emit("adbd_unreachable", map[string]any{"reason": err.Error()})
 		c.Close()
 		return
