@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.RestrictionsManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.os.UserManager
@@ -83,14 +84,22 @@ class AgentService : Service() {
         )
     }
 
+    private fun activeDnsServers(): List<String> {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val lp = cm.getLinkProperties(cm.activeNetwork ?: return emptyList()) ?: return emptyList()
+        return lp.dnsServers.mapNotNull { it.hostAddress }
+    }
+
     /** Runs the agent, restarting it with backoff if it exits (e.g. killed by OEM battery savers). */
     private suspend fun superviseAgent(cfg: DeviceAgentConfig) {
         val exe = File(applicationInfo.nativeLibraryDir, "libgenadb.so")
         var backoff = 1000L
         while (scope.isActive) {
-            val p = ProcessBuilder(listOf(exe.absolutePath) + cfg.toArgs())
+            val pb = ProcessBuilder(listOf(exe.absolutePath) + cfg.toArgs())
                 .redirectError(File(cacheDir, "agent.log"))
-                .start()
+            // The native agent has no system resolver; hand it the active network's DNS servers.
+            activeDnsServers().takeIf { it.isNotEmpty() }?.let { pb.environment()["GENADB_DNS"] = it.joinToString(",") }
+            val p = pb.start()
             proc = p
             p.inputStream.bufferedReader().useLines { lines ->
                 lines.forEach { line ->
