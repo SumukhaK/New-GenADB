@@ -69,7 +69,13 @@ func cmdConnect(args []string) error {
 				c.Close()
 				return
 			}
-			splice(a, a, c, br)
+			sc, err := handshake(c, br, true)
+			if err != nil {
+				a.Close()
+				c.Close()
+				return
+			}
+			splice(a, a, sc, sc)
 		}(a)
 	}
 }

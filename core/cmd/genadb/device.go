@@ -95,7 +95,13 @@ func openData(relayAddr, adbd, sid string) {
 		c.Close()
 		return
 	}
-	splice(c, c, a, a)
+	sc, err := handshake(c, c, false)
+	if err != nil {
+		a.Close()
+		c.Close()
+		return
+	}
+	splice(sc, sc, a, a)
 }
 
 func deviceID(state, mode, enroll string) (string, error) {
