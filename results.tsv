@@ -11,3 +11,4 @@ bba054b	8	98.973711	KEEP	ADB-aware split flow control (local WRTE acks + paced d
 2fa124a	9	98.982365	DISCARD	256KiB AEAD frames: +0.01, within noise; push is RTT/link bound (3 unspoofable RTTs + 25MB/s link cap) [device: not run]
 5e2aa59	10	98.967805	KEEP	Milestone B+C: ws/wss relay transport + CONNECT proxy + relay rate limiting; no regression (tests/transport_e2e.py PASS: ws 98.83, wss 98.74, wss+proxy 98.67) [device: pending]
 b24391e	11	98.982106	KEEP	Milestone C: mDNS discovery/tracking of the dynamic Wireless-debugging port (--adbd auto) + go unit tests; no regression [device: pending]
+d60bdb2	12	98.970892	KEEP	Milestone D: Android companion scaffold (agent-protocol JVM tests 3/3; app module unbuilt, no SDK here); no regression [device: pending]
