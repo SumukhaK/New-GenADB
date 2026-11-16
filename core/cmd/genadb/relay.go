@@ -68,7 +68,13 @@ type relay struct {
 	revoked   map[string]bool // "user:<u>" / "device:<d>"
 	auditMu   sync.Mutex
 	audit     *os.File
+	limits    *limiter
+	pendingBy map[string]int // device id -> session opens awaiting the device
 }
+
+const maxPendingPerDevice = 16
+
+func (r *relay) allow(ip, kind string) bool { return r.limits.take(ip, kind, false) }
 
 func cmdRelay(args []string) error {
 	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
@@ -78,11 +84,15 @@ func cmdRelay(args []string) error {
 	auditPath := fs.String("audit", "", "audit log path (JSONL)")
 	adminAddr := fs.String("admin", "", "admin listen address")
 	adminToken := fs.String("admin-token", "", "admin bearer token")
+	wsListen := fs.String("ws-listen", "", "also accept clients over WebSocket on this address (ws://, or wss:// with --tls-cert)")
+	tlsCert := fs.String("tls-cert", "", "TLS certificate (PEM) for --ws-listen")
+	tlsKey := fs.String("tls-key", "", "TLS private key (PEM) for --ws-listen")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	r := &relay{devices: map[string]*deviceEntry{}, pending: map[string]chan net.Conn{},
-		pendR: map[string]*bufio.Reader{}, sessions: map[string]*session{}, revoked: map[string]bool{}}
+		pendR: map[string]*bufio.Reader{}, sessions: map[string]*session{}, revoked: map[string]bool{},
+		limits: newLimiter(), pendingBy: map[string]int{}}
 	if *mode == "corporate" {
 		p, err := loadPolicy(*policyPath)
 		if err != nil {
@@ -111,7 +121,12 @@ func cmdRelay(args []string) error {
 		}
 		go http.Serve(aln, r.adminHandler(*adminToken))
 	}
-	emit("ready", map[string]any{"addr": ln.Addr().String(), "mode": *mode})
+	if *wsListen != "" {
+		if err := r.serveWebSocket(*wsListen, *tlsCert, *tlsKey); err != nil {
+			return err
+		}
+	}
+	emit("ready", map[string]any{"addr": ln.Addr().String(), "mode": *mode, "ws": *wsListen})
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -119,6 +134,10 @@ func cmdRelay(args []string) error {
 		}
 		if tc, ok := c.(*net.TCPConn); ok {
 			tc.SetNoDelay(true)
+		}
+		if !r.allow(clientIP(c.RemoteAddr().String()), "accept") {
+			c.Close()
+			continue
 		}
 		go r.handle(c)
 	}
@@ -212,6 +231,7 @@ func (r *relay) authenticate(c net.Conn, br *bufio.Reader, h hello, typ string) 
 }
 
 func (r *relay) deny(c net.Conn, f map[string]any, reason string) {
+	r.allow(clientIP(c.RemoteAddr().String()), "auth-fail")
 	f["reason"] = reason
 	r.auditEvent("denied", f)
 	writeHello(c, reply{OK: false, Reason: reason})
@@ -219,6 +239,7 @@ func (r *relay) deny(c net.Conn, f map[string]any, reason string) {
 }
 
 func (r *relay) handle(c net.Conn) {
+	ip := clientIP(c.RemoteAddr().String())
 	br := bufio.NewReader(c)
 	c.SetReadDeadline(time.Now().Add(15 * time.Second))
 	var h hello
@@ -226,8 +247,20 @@ func (r *relay) handle(c net.Conn) {
 		c.Close()
 		return
 	}
+	limited := func(kind string) bool {
+		if !r.limits.take(ip, "auth-fail", true) || !r.allow(ip, kind) {
+			r.auditEvent("rate_limited", map[string]any{"role": h.Role, "kind": kind})
+			writeHello(c, reply{OK: false, Reason: "rate limited"})
+			c.Close()
+			return true
+		}
+		return false
+	}
 	switch h.Role {
 	case "device":
+		if limited("device") {
+			return
+		}
 		if r.corporate {
 			sub, err := r.authenticate(c, br, h, "device")
 			if err != nil || sub != h.DeviceID {
@@ -298,6 +331,9 @@ func (r *relay) handle(c net.Conn) {
 		}
 		ch <- c
 	case "desktop":
+		if limited("desktop") {
+			return
+		}
 		user := ""
 		if r.corporate {
 			sub, err := r.authenticate(c, br, h, "user")
@@ -346,6 +382,13 @@ func (r *relay) handle(c net.Conn) {
 		sid := hex.EncodeToString(sidb)
 		ch := make(chan net.Conn, 1)
 		r.mu.Lock()
+		if r.pendingBy[id] >= maxPendingPerDevice {
+			r.mu.Unlock()
+			writeHello(c, reply{OK: false, Reason: "device busy"})
+			c.Close()
+			return
+		}
+		r.pendingBy[id]++
 		r.pending[sid] = ch
 		r.mu.Unlock()
 		e.wmu.Lock()
@@ -362,6 +405,7 @@ func (r *relay) handle(c net.Conn) {
 		dbr := r.pendR[sid]
 		delete(r.pending, sid)
 		delete(r.pendR, sid)
+		r.pendingBy[id]--
 		r.mu.Unlock()
 		if dc == nil {
 			writeHello(c, reply{OK: false, Reason: "device did not answer"})

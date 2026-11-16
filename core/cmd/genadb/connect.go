@@ -24,6 +24,7 @@ func cmdConnect(args []string) error {
 	state := fs.String("state", ".", "state directory")
 	listen := fs.String("listen", "127.0.0.1:0", "local adb endpoint to expose")
 	mode := fs.String("mode", "solo", "solo|corporate")
+	addTransportFlags(fs)
 	code := fs.String("code", "", "pairing code shown on the phone (NNNN-SSSSSS)")
 	device := fs.String("device", "", "previously paired device id")
 	identity := fs.String("identity", "", "user identity JWT (corporate)")
@@ -174,7 +175,7 @@ func (a *desktopAgent) openSession(h hello) (net.Conn, *bufio.Reader, string, er
 
 // openSessionRep asks the relay for a spliced stream to the device.
 func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, error) {
-	c, err := dial(a.relayAddr)
+	c, err := dialRelay(a.relayAddr)
 	if err != nil {
 		return nil, nil, reply{}, err
 	}
@@ -188,7 +189,7 @@ func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, 
 	if !rep.OK {
 		c.Close()
 		switch rep.Reason {
-		case "device offline", "unknown device or code", "device did not answer":
+		case "device offline", "unknown device or code", "device did not answer", "device busy", "rate limited":
 			return nil, nil, reply{}, fmt.Errorf("device unavailable: %s", rep.Reason)
 		}
 		return nil, nil, reply{}, fmt.Errorf("%w: %s", errDenied, rep.Reason)

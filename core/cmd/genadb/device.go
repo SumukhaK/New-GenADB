@@ -62,6 +62,7 @@ func cmdDevice(args []string) error {
 	enroll := fs.String("enroll", "", "device enrollment JWT (corporate)")
 	policyPath := fs.String("policy", "", "policy file (corporate)")
 	debugPolicy := fs.String("debug-policy", "allowed", "allowed|disallowed (MDM DISALLOW_DEBUGGING_FEATURES)")
+	addTransportFlags(fs)
 	lanListen := fs.String("lan-listen", "", "LAN listen address (solo: direct path)")
 	lanAdvertise := fs.String("lan-advertise", "", "LAN address to advertise (default: lan-listen)")
 	if err := fs.Parse(args); err != nil {
@@ -135,7 +136,7 @@ func (d *deviceAgent) rotateCode() {
 }
 
 func (d *deviceAgent) session(announced *bool) error {
-	c, err := dial(d.relayAddr)
+	c, err := dialRelay(d.relayAddr)
 	if err != nil {
 		return err
 	}
@@ -225,7 +226,7 @@ func (d *deviceAgent) policy() responderPolicy {
 }
 
 func (d *deviceAgent) openData(sid string) {
-	c, err := dial(d.relayAddr)
+	c, err := dialRelay(d.relayAddr)
 	if err != nil {
 		return
 	}
@@ -236,7 +237,25 @@ func (d *deviceAgent) openData(sid string) {
 	d.serveStream(c)
 }
 
+// handshakeSlots bounds concurrent unauthenticated handshakes so a flood of
+// session opens cannot exhaust the phone.
+var handshakeSlots = make(chan struct{}, 16)
+
 func (d *deviceAgent) serveStream(c net.Conn) {
+	select {
+	case handshakeSlots <- struct{}{}:
+	default:
+		c.Close()
+		return
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			<-handshakeSlots
+		}
+	}
+	defer release()
 	var m1 hsMsg
 	c.SetReadDeadline(time.Now().Add(15 * time.Second))
 	b1, err := readMsg(c, &m1)
@@ -262,6 +281,7 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		c.Close()
 		return
 	}
+	release()
 	t := newTunnel(sc, accelerate(a), false)
 	key := hex.EncodeToString(t.sid)
 	d.mu.Lock()
