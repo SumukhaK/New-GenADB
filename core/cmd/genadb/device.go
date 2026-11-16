@@ -72,7 +72,11 @@ func cmdDevice(args []string) error {
 	if *debugPolicy != "allowed" {
 		// MDM has disabled debugging features: never offer a tunnel to adbd.
 		emit("blocked", map[string]any{"reason": "debugging_disallowed"})
-		select {} // stay visible to the UI but do nothing
+		// Stay visible to the UI but do nothing. A bare select{} with no
+		// other goroutine alive is a fatal runtime deadlock, so sleep.
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
 	key, err := loadOrCreateKey(*state)
 	if err != nil {
