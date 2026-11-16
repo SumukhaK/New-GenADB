@@ -126,7 +126,15 @@ func (r *relay) serveWebSocket(addr, certFile, keyFile string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		if !r.allow(clientIP(req.RemoteAddr), "ws-accept") {
+		remote := req.RemoteAddr
+		if r.trustForwarded {
+			// Behind a reverse proxy / tunnel every client shares the proxy's
+			// address; rate-limit and audit by the address it reports instead.
+			if ip := forwardedIP(req); ip != "" {
+				remote = net.JoinHostPort(ip, "0")
+			}
+		}
+		if !r.allow(clientIP(remote), "ws-accept") {
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return
 		}
@@ -136,7 +144,7 @@ func (r *relay) serveWebSocket(addr, certFile, keyFile string) error {
 		}
 		c.SetReadLimit(-1)
 		nc := websocket.NetConn(context.Background(), c, websocket.MessageBinary)
-		r.handle(&wsConn{Conn: nc, remote: req.RemoteAddr})
+		r.handle(&wsConn{Conn: nc, remote: remote})
 	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
@@ -161,6 +169,22 @@ type wsAddr string
 
 func (a wsAddr) Network() string { return "ws" }
 func (a wsAddr) String() string  { return string(a) }
+
+// forwardedIP returns the client address reported by a trusted reverse proxy.
+func forwardedIP(req *http.Request) string {
+	for _, h := range []string{"CF-Connecting-IP", "X-Real-IP"} {
+		if ip := net.ParseIP(strings.TrimSpace(req.Header.Get(h))); ip != nil {
+			return ip.String()
+		}
+	}
+	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
+		first, _, _ := strings.Cut(xff, ",")
+		if ip := net.ParseIP(strings.TrimSpace(first)); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
+}
 
 func clientIP(addr string) string {
 	h, _, err := net.SplitHostPort(addr)

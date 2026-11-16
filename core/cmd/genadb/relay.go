@@ -58,18 +58,19 @@ func (s *session) kill() {
 }
 
 type relay struct {
-	mu        sync.Mutex
-	corporate bool
-	pol       *policy
-	devices   map[string]*deviceEntry
-	pending   map[string]chan net.Conn // sid -> data conn from device
-	pendR     map[string]*bufio.Reader
-	sessions  map[string]*session
-	revoked   map[string]bool // "user:<u>" / "device:<d>"
-	auditMu   sync.Mutex
-	audit     *os.File
-	limits    *limiter
-	pendingBy map[string]int // device id -> session opens awaiting the device
+	mu             sync.Mutex
+	corporate      bool
+	pol            *policy
+	devices        map[string]*deviceEntry
+	pending        map[string]chan net.Conn // sid -> data conn from device
+	pendR          map[string]*bufio.Reader
+	sessions       map[string]*session
+	revoked        map[string]bool // "user:<u>" / "device:<d>"
+	auditMu        sync.Mutex
+	audit          *os.File
+	limits         *limiter
+	pendingBy      map[string]int // device id -> session opens awaiting the device
+	trustForwarded bool
 }
 
 const maxPendingPerDevice = 16
@@ -87,12 +88,14 @@ func cmdRelay(args []string) error {
 	wsListen := fs.String("ws-listen", "", "also accept clients over WebSocket on this address (ws://, or wss:// with --tls-cert)")
 	tlsCert := fs.String("tls-cert", "", "TLS certificate (PEM) for --ws-listen")
 	tlsKey := fs.String("tls-key", "", "TLS private key (PEM) for --ws-listen")
+	trustFwd := fs.Bool("trust-forwarded", false, "take client IPs from CF-Connecting-IP / X-Forwarded-For on --ws-listen (only behind a reverse proxy or tunnel you control)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	r := &relay{devices: map[string]*deviceEntry{}, pending: map[string]chan net.Conn{},
 		pendR: map[string]*bufio.Reader{}, sessions: map[string]*session{}, revoked: map[string]bool{},
 		limits: newLimiter(), pendingBy: map[string]int{}}
+	r.trustForwarded = *trustFwd
 	if *mode == "corporate" {
 		p, err := loadPolicy(*policyPath)
 		if err != nil {
