@@ -1,4 +1,15 @@
-# New-GenADB
+<p align="center">
+  <img src="assets/logo.svg" width="112" height="112" alt="New-GenADB logo: an encrypted tunnel between an Android phone and a developer terminal">
+</p>
+
+<h1 align="center">New-GenADB</h1>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-3B82F6?style=flat-square"></a>
+  <a href="API_SPEC.md"><img alt="Go SDK" src="https://img.shields.io/badge/Go_SDK-1.24%2B-10B981?style=flat-square&logo=go&logoColor=white"></a>
+  <a href="android/genadb-android"><img alt="Android AAR" src="https://img.shields.io/badge/Android_AAR-API_29%2B-059669?style=flat-square&logo=android&logoColor=white"></a>
+  <a href="results.tsv"><img alt="Eval score: 98.97/100" src="https://img.shields.io/badge/eval_score-98.97%2F100-0F172A?style=flat-square"></a>
+</p>
 
 **Use a real Android phone from anywhere as if it were plugged into your computer.** New-GenADB connects Android Studio, any IDE, or plain `adb` to a physical device on another network: across the office, across the country, or behind a carrier NAT. You can deploy APKs and AABs, stream logcat, debug, push and pull files, and take screenshots.
 
@@ -46,16 +57,33 @@ flowchart LR
     R <-->|"TCP / WebSocket / WSS"| DA
     CA <-.->|"direct LAN path when available"| DA
     CA ==>|"end-to-end encrypted tunnel"| DA
+
+    classDef dev fill:#EFF6FF,stroke:#2563EB,stroke-width:1.5px,color:#1E3A8A
+    classDef relay fill:#FFFBEB,stroke:#D97706,stroke-width:1.5px,color:#78350F
+    classDef phone fill:#ECFDF5,stroke:#059669,stroke-width:1.5px,color:#064E3B
+    class IDE,CA dev
+    class R relay
+    class DA,ADBD phone
+    style Dev fill:#2563EB12,stroke:#2563EB,stroke-width:1px,color:#3B82F6
+    style Net fill:#D9770612,stroke:#D97706,stroke-width:1px,color:#F59E0B
+    style Phone fill:#05966912,stroke:#059669,stroke-width:1px,color:#10B981
+    linkStyle 5 stroke:#059669,stroke-width:3px
 ```
 
 Each side connects outbound to the relay, so neither the phone nor the computer needs an open port. The relay matches the two sides and splices their connections. The two agents then establish their own encrypted, authenticated session through that splice. In solo mode the relay forwards only and learns nothing about what you do.
 
 ```mermaid
 sequenceDiagram
-    participant P as Phone (device agent)
-    participant R as Relay
-    participant D as Desktop (connect agent)
-    participant A as adb / IDE
+    box rgba(5,150,105,0.10) Android device
+        participant P as Phone (device agent)
+    end
+    box rgba(217,119,6,0.10) Internet
+        participant R as Relay
+    end
+    box rgba(37,99,235,0.10) Developer computer
+        participant D as Desktop (connect agent)
+        participant A as adb / IDE
+    end
     P->>R: register (outbound)
     Note over P: shows a one-time pairing code
     D->>R: connect with code (solo) or identity token (corporate)
@@ -88,6 +116,17 @@ flowchart TB
         APP --> LIB
     end
     LIB -->|"runs as libgenadb.so"| CLI
+
+    classDef dev fill:#EFF6FF,stroke:#2563EB,stroke-width:1.5px,color:#1E3A8A
+    classDef relay fill:#FFFBEB,stroke:#D97706,stroke-width:1.5px,color:#78350F
+    classDef phone fill:#ECFDF5,stroke:#059669,stroke-width:1.5px,color:#064E3B
+    classDef engine fill:#F1F5F9,stroke:#475569,stroke-width:1.5px,color:#0F172A
+    class CLI,DMN,SDK dev
+    class AUD relay
+    class ENG engine
+    class LIB,APP phone
+    style Go fill:#2563EB12,stroke:#2563EB,stroke-width:1px,color:#3B82F6
+    style Android fill:#05966912,stroke:#059669,stroke-width:1px,color:#10B981
 ```
 
 The wire protocol, framing and session security live in `internal/engine` and are deliberately not part of any public API.
@@ -226,7 +265,7 @@ These figures come from the locked evaluation harness (`eval.py`, a simulated WA
 
 | Metric | Result |
 |---|---|
-| Overall eval score | 98.9 / 100 |
+| Overall eval score | 98.97 / 100 |
 | Time from `connect` to `adb`-ready | 0.9 s |
 | Push throughput through the relay (simulated WAN) | 11 MB/s, up from 5.7 MB/s before ADB-aware flow control |
 | Logcat line latency (median) | 44 ms, down from 86 ms |
