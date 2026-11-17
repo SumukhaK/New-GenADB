@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"errors"
@@ -32,6 +32,7 @@ type adbdResolver struct {
 	service  string // e.g. _adb-tls-connect._tcp.local.
 	prefer   func(net.IP) bool
 	fallback string // used when discovery finds nothing but this endpoint accepts a connection
+	events   EventFunc
 
 	mu   sync.Mutex
 	last string
@@ -94,7 +95,9 @@ func (r *adbdResolver) refresh() (string, error) {
 	r.last = pick
 	r.mu.Unlock()
 	if changed {
-		emit("adbd_endpoint", map[string]any{"addr": pick, "service": r.service})
+		if r.events != nil {
+			r.events("adbd_endpoint", map[string]any{"addr": pick, "service": r.service})
+		}
 	}
 	return pick, nil
 }

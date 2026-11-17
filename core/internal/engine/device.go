@@ -1,13 +1,13 @@
-package main
+package engine
 
 import (
 	"bufio"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"math/big"
 	"net"
@@ -36,6 +36,8 @@ type deviceAgent struct {
 	token     string
 	lan       string
 	tunnels   map[string]*tunnel
+	dial      Dialer
+	events    EventFunc
 }
 
 // serveLAN accepts direct connections from desktops on the same network.
@@ -53,63 +55,94 @@ func (d *deviceAgent) serveLAN(ln net.Listener) {
 	}
 }
 
-func cmdDevice(args []string) error {
-	fs := flag.NewFlagSet("device", flag.ContinueOnError)
-	relayAddr := fs.String("relay", "", "relay address")
-	adbd := fs.String("adbd", "127.0.0.1:5555", "adbd endpoint host:port, or 'auto' to discover Wireless debugging via mDNS (auto-legacy: _adb._tcp)")
-	state := fs.String("state", ".", "state directory")
-	mode := fs.String("mode", "solo", "solo|corporate")
-	fs.String("name", "", "device name")
-	enroll := fs.String("enroll", "", "device enrollment JWT (corporate)")
-	policyPath := fs.String("policy", "", "policy file (corporate)")
-	debugPolicy := fs.String("debug-policy", "allowed", "allowed|disallowed (MDM DISALLOW_DEBUGGING_FEATURES)")
-	addTransportFlags(fs)
-	lanListen := fs.String("lan-listen", "", "LAN listen address (solo: direct path)")
-	lanAdvertise := fs.String("lan-advertise", "", "LAN address to advertise (default: lan-listen)")
-	if err := fs.Parse(args); err != nil {
-		return err
+// DeviceConfig configures the phone-side device agent.
+type DeviceConfig struct {
+	Relay        string           // relay address: host:port, ws://... or wss://...
+	ADBD         string           // adbd endpoint host:port, "auto", "mdns" or "auto-legacy"
+	State        string           // directory for the identity key, device id and pins
+	Mode         string           // "solo" (default) or "corporate"
+	Enroll       string           // device enrollment JWT (corporate)
+	PolicyPath   string           // policy file (corporate)
+	DebugAllowed bool             // false = MDM DISALLOW_DEBUGGING_FEATURES: never tunnel
+	LANListen    string           // solo: accept direct connections on this address
+	LANAdvertise string           // solo: address advertised to desktops (default LANListen)
+	Transport    TransportOptions // relay transport options
+	Dial         Dialer           // overrides the relay dialer
+	Events       EventFunc        // receives events; nil = discard
+}
+
+// RunDevice registers the device with the relay and serves tunnels to adbd
+// until ctx is cancelled. When debugging is disallowed it emits "blocked" and
+// waits for ctx without ever touching adbd.
+func RunDevice(ctx context.Context, cfg DeviceConfig) error {
+	if cfg.Events == nil {
+		cfg.Events = func(string, map[string]any) {}
 	}
-	if *debugPolicy != "allowed" {
+	if cfg.Mode == "" {
+		cfg.Mode = "solo"
+	}
+	if cfg.State == "" {
+		cfg.State = "."
+	}
+	if cfg.ADBD == "" {
+		cfg.ADBD = "127.0.0.1:5555"
+	}
+	if cfg.Dial == nil {
+		cfg.Dial = cfg.Transport.Dialer()
+	}
+	if !cfg.DebugAllowed {
 		// MDM has disabled debugging features: never offer a tunnel to adbd.
-		emit("blocked", map[string]any{"reason": "debugging_disallowed"})
-		// Stay visible to the UI but do nothing. A bare select{} with no
-		// other goroutine alive is a fatal runtime deadlock, so sleep.
-		for {
-			time.Sleep(time.Hour)
-		}
+		cfg.Events("blocked", map[string]any{"reason": "debugging_disallowed"})
+		<-ctx.Done()
+		return ctx.Err()
 	}
-	key, err := loadOrCreateKey(*state)
+	key, err := loadOrCreateKey(cfg.State)
 	if err != nil {
 		return err
 	}
-	id, err := deviceID(*state, *mode, *enroll)
+	id, err := deviceID(cfg.State, cfg.Mode, cfg.Enroll)
 	if err != nil {
 		return err
 	}
-	d := &deviceAgent{relayAddr: *relayAddr, adbd: newAdbdResolver(*adbd), state: *state, mode: *mode, id: id, key: key,
-		pins: loadPins(*state), token: *enroll, tunnels: map[string]*tunnel{}}
+	res := newAdbdResolver(cfg.ADBD)
+	res.events = cfg.Events
+	d := &deviceAgent{relayAddr: cfg.Relay, adbd: res, state: cfg.State, mode: cfg.Mode, id: id, key: key,
+		pins: loadPins(cfg.State), token: cfg.Enroll, tunnels: map[string]*tunnel{}, dial: cfg.Dial, events: cfg.Events}
 	if d.mode == "corporate" {
-		if d.pol, err = loadPolicy(*policyPath); err != nil {
+		if d.pol, err = loadPolicy(cfg.PolicyPath); err != nil {
 			return err
 		}
-		if _, err := d.pol.verifyToken(*enroll, "device", key.Public().(ed25519.PublicKey)); err != nil {
+		if _, err := d.pol.verifyToken(cfg.Enroll, "device", key.Public().(ed25519.PublicKey)); err != nil {
 			return fmt.Errorf("enrollment token: %w", err)
 		}
 	}
 	if d.mode == "solo" {
 		d.newCode()
-		if *lanListen != "" {
-			ln, err := net.Listen("tcp", *lanListen)
+		if cfg.LANListen != "" {
+			ln, err := net.Listen("tcp", cfg.LANListen)
 			if err != nil {
 				return err
 			}
-			d.lan = *lanAdvertise
+			defer context.AfterFunc(ctx, func() { ln.Close() })()
+			d.lan = cfg.LANAdvertise
 			if d.lan == "" {
 				d.lan = ln.Addr().String()
 			}
 			go d.serveLAN(ln)
 		}
 	}
+	defer context.AfterFunc(ctx, func() {
+		d.ctrlMu.Lock()
+		if d.ctrl != nil {
+			d.ctrl.Close()
+		}
+		d.ctrlMu.Unlock()
+		d.mu.Lock()
+		for _, t := range d.tunnels {
+			t.close()
+		}
+		d.mu.Unlock()
+	})()
 	announced := false
 	// Reconnect quickly after a session that was up for a while (a relay
 	// restart), back off to 5 s once the network has been down for ~10 s, and log only
@@ -118,6 +151,9 @@ func cmdDevice(args []string) error {
 	for {
 		started := time.Now()
 		err := d.session(&announced)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if time.Since(started) > 30*time.Second {
 			backoff, failures = time.Second, 0
 		}
@@ -127,7 +163,11 @@ func cmdDevice(args []string) error {
 		} else if failures%30 == 0 {
 			logf("relay still unreachable after %d attempts: %v", failures, err)
 		}
-		time.Sleep(backoff)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
 		if failures > 10 && backoff < 5*time.Second {
 			backoff += time.Second
 		}
@@ -141,7 +181,7 @@ func (d *deviceAgent) newCode() {
 }
 
 func (d *deviceAgent) emitCode() {
-	emit("pairing_code", map[string]any{"code": d.nameplate + "-" + d.secret, "device_id": d.id})
+	d.events("pairing_code", map[string]any{"code": d.nameplate + "-" + d.secret, "device_id": d.id})
 }
 
 // rotateCode issues a fresh code and tells the relay the new nameplate.
@@ -157,7 +197,7 @@ func (d *deviceAgent) rotateCode() {
 }
 
 func (d *deviceAgent) session(announced *bool) error {
-	c, err := dialRelay(d.relayAddr)
+	c, err := d.dial(d.relayAddr)
 	if err != nil {
 		return err
 	}
@@ -181,7 +221,7 @@ func (d *deviceAgent) session(announced *bool) error {
 	d.ctrlMu.Unlock()
 	defer func() { d.ctrlMu.Lock(); d.ctrl = nil; d.ctrlMu.Unlock() }()
 	if !*announced {
-		emit("online", map[string]any{"device_id": d.id})
+		d.events("online", map[string]any{"device_id": d.id})
 		if d.mode == "solo" {
 			d.mu.Lock()
 			d.emitCode()
@@ -247,7 +287,7 @@ func (d *deviceAgent) policy() responderPolicy {
 }
 
 func (d *deviceAgent) openData(sid string) {
-	c, err := dialRelay(d.relayAddr)
+	c, err := d.dial(d.relayAddr)
 	if err != nil {
 		return
 	}
@@ -304,7 +344,7 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 	a, err := d.dialAdbdPatiently() // adbd is only touched after authentication
 	if err != nil {
 		logf("adbd unreachable: %v", err)
-		emit("adbd_unreachable", map[string]any{"reason": err.Error()})
+		d.events("adbd_unreachable", map[string]any{"reason": err.Error()})
 		c.Close()
 		return
 	}

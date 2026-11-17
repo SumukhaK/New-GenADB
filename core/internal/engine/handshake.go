@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"crypto/ecdh"
@@ -160,7 +160,7 @@ func clientHandshake(c net.Conn, r io.Reader, p initiatorParams) (*secureConn, e
 	}
 	k := deriveKeys(dh, pakeK, th1)
 	if sp != nil && !hmac.Equal(m2.MAC, mac(k.confirm, "device", th1)) {
-		return nil, nil, errors.New("pairing code rejected")
+		return nil, nil, ErrBadCode
 	}
 	if !ed25519.Verify(peerID, append([]byte("genadb-dev-sig"), th1...), m2.Sig) {
 		return nil, nil, errors.New("device signature invalid")

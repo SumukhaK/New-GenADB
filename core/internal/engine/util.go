@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"bufio"
@@ -6,20 +6,22 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var emitMu sync.Mutex
 
 // emit writes one JSON event line to stdout (the harness/UI contract).
-func emit(event string, fields map[string]any) {
+// StdoutEvents writes each event as one JSON line on stdout (the CLI's
+// machine-readable contract).
+func StdoutEvents(event string, fields map[string]any) {
 	m := map[string]any{"event": event}
 	for k, v := range fields {
 		m[k] = v
@@ -105,8 +107,6 @@ func dialTimeout(addr string, d time.Duration) (net.Conn, error) {
 	return c, nil
 }
 
-var errDenied = errors.New("denied")
-
 // relayHello sends a hello to the relay and completes the corporate
 // proof-of-possession challenge if the relay asks for one.
 func relayHello(c net.Conn, br *bufio.Reader, h hello, key ed25519.PrivateKey) (reply, error) {
@@ -136,7 +136,23 @@ func relayHello(c net.Conn, br *bufio.Reader, h hello, key ed25519.PrivateKey) (
 // logf writes a timestamped diagnostic line to stderr. Events for machines go
 // to stdout via emit; this is for humans debugging a field failure.
 func logf(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	if h := logHook.Load(); h != nil {
+		(*h)(line)
+		return
+	}
 	emitMu.Lock()
-	fmt.Fprintf(os.Stderr, "%s genadb: %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))
+	fmt.Fprintf(os.Stderr, "%s genadb: %s\n", time.Now().Format("15:04:05.000"), line)
 	emitMu.Unlock()
+}
+
+var logHook atomic.Pointer[func(string)]
+
+// SetLogger redirects diagnostic log lines (nil restores stderr).
+func SetLogger(f func(line string)) {
+	if f == nil {
+		logHook.Store(nil)
+		return
+	}
+	logHook.Store(&f)
 }

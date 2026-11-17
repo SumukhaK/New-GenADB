@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"context"
@@ -35,21 +35,40 @@ import (
 // end-to-end encrypted session, so TLS here protects metadata (device ids,
 // tokens on the relay hop) rather than adb payloads, which are already E2E.
 
-type transportOpts struct {
-	proxy       string // http://host:port (CONNECT) ; "" = environment
-	caFile      string // extra trusted CA / self-signed relay cert (PEM)
-	fingerprint string // optional SHA-256 pin of the relay leaf certificate
+// TransportOptions configures how agents reach the relay.
+type TransportOptions struct {
+	Proxy  string // http://host:port (CONNECT) ; "" = environment
+	CAFile string // extra trusted CA / self-signed relay cert (PEM)
+	Pin    string // optional hex SHA-256 pin of the relay leaf certificate
 }
 
-var relayTransport transportOpts
-
-func addTransportFlags(fs *flag.FlagSet) {
-	fs.StringVar(&relayTransport.proxy, "proxy", "", "HTTP proxy for ws/wss relay URLs (default: HTTPS_PROXY/HTTP_PROXY)")
-	fs.StringVar(&relayTransport.caFile, "relay-ca", "", "PEM file with a CA or certificate to trust for wss relays")
-	fs.StringVar(&relayTransport.fingerprint, "relay-pin", "", "hex SHA-256 of the relay TLS certificate to pin")
+// AddTransportFlags registers --proxy, --relay-ca and --relay-pin.
+func AddTransportFlags(fs *flag.FlagSet, o *TransportOptions) {
+	fs.StringVar(&o.Proxy, "proxy", "", "HTTP proxy for ws/wss relay URLs (default: HTTPS_PROXY/HTTP_PROXY)")
+	fs.StringVar(&o.CAFile, "relay-ca", "", "PEM file with a CA or certificate to trust for wss relays")
+	fs.StringVar(&o.Pin, "relay-pin", "", "hex SHA-256 of the relay TLS certificate to pin")
 }
 
-func dialRelay(spec string) (net.Conn, error) {
+// Dialer opens a byte stream to the relay named by spec.
+type Dialer func(spec string) (net.Conn, error)
+
+// Dialer returns the default relay dialer for these options.
+func (o TransportOptions) Dialer() Dialer {
+	return func(spec string) (net.Conn, error) { return o.dialRelay(spec) }
+}
+
+// TransportLabel classifies a relay spec for audit records.
+func TransportLabel(spec string) string {
+	switch {
+	case strings.HasPrefix(spec, "wss://"):
+		return "relay-wss"
+	case strings.HasPrefix(spec, "ws://"):
+		return "relay-ws"
+	}
+	return "relay-tcp"
+}
+
+func (o TransportOptions) dialRelay(spec string) (net.Conn, error) {
 	if !strings.Contains(spec, "://") {
 		return dial(spec)
 	}
@@ -62,14 +81,14 @@ func dialRelay(spec string) (net.Conn, error) {
 	}
 	tr := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: false,
 		TLSHandshakeTimeout: 10 * time.Second, DialContext: relayDialContext}
-	if relayTransport.proxy != "" {
-		pu, err := url.Parse(relayTransport.proxy)
+	if o.Proxy != "" {
+		pu, err := url.Parse(o.Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("bad --proxy: %w", err)
 		}
 		tr.Proxy = http.ProxyURL(pu)
 	}
-	tcfg, err := relayTLSConfig()
+	tcfg, err := o.relayTLSConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -151,10 +170,10 @@ func relayDialContext(ctx context.Context, network, addr string) (net.Conn, erro
 	return nil, last
 }
 
-func relayTLSConfig() (*tls.Config, error) {
+func (o TransportOptions) relayTLSConfig() (*tls.Config, error) {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if relayTransport.caFile != "" {
-		pem, err := os.ReadFile(relayTransport.caFile)
+	if o.CAFile != "" {
+		pem, err := os.ReadFile(o.CAFile)
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +186,7 @@ func relayTLSConfig() (*tls.Config, error) {
 		}
 		cfg.RootCAs = pool
 	}
-	if pin := strings.ToLower(strings.ReplaceAll(relayTransport.fingerprint, ":", "")); pin != "" {
+	if pin := strings.ToLower(strings.ReplaceAll(o.Pin, ":", "")); pin != "" {
 		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
 				return errors.New("relay presented no certificate")
@@ -184,10 +203,10 @@ func relayTLSConfig() (*tls.Config, error) {
 
 // serveWebSocket accepts relay clients over ws:// (or wss:// when a
 // certificate is given) and hands each upgraded stream to the relay.
-func (r *relay) serveWebSocket(addr, certFile, keyFile string) error {
+func (r *relay) serveWebSocket(addr, certFile, keyFile string) (net.Listener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
@@ -221,7 +240,7 @@ func (r *relay) serveWebSocket(addr, certFile, keyFile string) error {
 			srv.Serve(ln)
 		}
 	}()
-	return nil
+	return ln, nil
 }
 
 // wsConn reports the HTTP client address (useful for rate limiting/audit).

@@ -1,38 +1,25 @@
-// Command genadb is the New-GenADB connectivity core: one binary that acts as
-// the rendezvous relay, the phone-side device agent and the desktop-side
-// connect agent (CLI). See remote_adb_research_findings.md section 16.
-//
-// BASELINE (iteration 0): deliberately simple. Plain TCP to the relay, one
-// relay connection per adb TCP connection, pairing code sent in clear,
-// no end-to-end encryption and no corporate policy enforcement.
+// Command genadb is the New-GenADB command-line tool: the rendezvous relay,
+// the phone-side device agent, the desktop-side connect agent, diagnostics
+// and audit reporting in one binary.
 package main
 
 import (
-	"fmt"
 	"os"
+
+	"github.com/sumukhak/new-genadb/core/internal/engine"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: genadb <keygen|relay|device|connect> [flags]")
-		os.Exit(2)
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "audit":
+			os.Exit(cmdAudit(os.Args[2:]))
+		case "doctor":
+			os.Exit(cmdDoctor(os.Args[2:]))
+		case "version", "--version":
+			os.Stdout.WriteString(engine.Version + "\n")
+			os.Exit(0)
+		}
 	}
-	var err error
-	switch os.Args[1] {
-	case "keygen":
-		err = cmdKeygen(os.Args[2:])
-	case "relay":
-		err = cmdRelay(os.Args[2:])
-	case "device":
-		err = cmdDevice(os.Args[2:])
-	case "connect":
-		err = cmdConnect(os.Args[2:])
-	default:
-		err = fmt.Errorf("unknown command %q", os.Args[1])
-	}
-	if err != nil {
-		emit("error", map[string]any{"reason": err.Error()})
-		fmt.Fprintln(os.Stderr, "genadb:", err)
-		os.Exit(1)
-	}
+	os.Exit(engine.CLI(os.Args[1:]))
 }

@@ -1,6 +1,8 @@
-package main
+package engine
 
 import (
+	"context"
+
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -9,10 +11,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
+	"github.com/sumukhak/new-genadb/core/pkg/genadb/audit"
 	"net"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 )
@@ -66,8 +67,7 @@ type relay struct {
 	pendR          map[string]*bufio.Reader
 	sessions       map[string]*session
 	revoked        map[string]bool // "user:<u>" / "device:<d>"
-	auditMu        sync.Mutex
-	audit          *os.File
+	audit          audit.Sink
 	limits         *limiter
 	pendingBy      map[string]int // device id -> session opens awaiting the device
 	trustForwarded bool
@@ -77,62 +77,97 @@ const maxPendingPerDevice = 16
 
 func (r *relay) allow(ip, kind string) bool { return r.limits.take(ip, kind, false) }
 
-func cmdRelay(args []string) error {
-	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
-	listen := fs.String("listen", "127.0.0.1:7000", "listen address")
-	mode := fs.String("mode", "solo", "solo|corporate")
-	policyPath := fs.String("policy", "", "policy file (corporate)")
-	auditPath := fs.String("audit", "", "audit log path (JSONL)")
-	adminAddr := fs.String("admin", "", "admin listen address")
-	adminToken := fs.String("admin-token", "", "admin bearer token")
-	wsListen := fs.String("ws-listen", "", "also accept clients over WebSocket on this address (ws://, or wss:// with --tls-cert)")
-	tlsCert := fs.String("tls-cert", "", "TLS certificate (PEM) for --ws-listen")
-	tlsKey := fs.String("tls-key", "", "TLS private key (PEM) for --ws-listen")
-	trustFwd := fs.Bool("trust-forwarded", false, "take client IPs from CF-Connecting-IP / X-Forwarded-For on --ws-listen (only behind a reverse proxy or tunnel you control)")
-	if err := fs.Parse(args); err != nil {
-		return err
+// RelayConfig configures the rendezvous relay.
+type RelayConfig struct {
+	Listen         string     // raw TCP listen address
+	Mode           string     // "solo" (default) or "corporate"
+	PolicyPath     string     // policy file (corporate)
+	AuditPath      string     // hash-chained JSONL audit log ("" = none)
+	Audit          audit.Sink // additional audit sink (e.g. a webhook)
+	AdminListen    string     // admin API listen address ("" = off)
+	AdminToken     string     // bearer token for the admin API
+	WSListen       string     // also accept WebSocket clients here
+	TLSCert        string     // serve wss:// on WSListen with this certificate
+	TLSKey         string
+	TrustForwarded bool      // take client IPs from proxy headers on WSListen
+	Events         EventFunc // receives "ready"; nil = discard
+}
+
+// RunRelay serves the relay until ctx is cancelled.
+func RunRelay(ctx context.Context, cfg RelayConfig) error {
+	if cfg.Events == nil {
+		cfg.Events = func(string, map[string]any) {}
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = "solo"
 	}
 	r := &relay{devices: map[string]*deviceEntry{}, pending: map[string]chan net.Conn{},
 		pendR: map[string]*bufio.Reader{}, sessions: map[string]*session{}, revoked: map[string]bool{},
 		limits: newLimiter(), pendingBy: map[string]int{}}
-	r.trustForwarded = *trustFwd
-	if *mode == "corporate" {
-		p, err := loadPolicy(*policyPath)
+	r.trustForwarded = cfg.TrustForwarded
+	if cfg.Mode == "corporate" {
+		p, err := loadPolicy(cfg.PolicyPath)
 		if err != nil {
 			return err
 		}
 		r.corporate, r.pol = true, p
 	}
-	if *auditPath != "" {
-		f, err := os.OpenFile(*auditPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	var sinks audit.MultiSink
+	if cfg.AuditPath != "" {
+		f, err := audit.OpenFile(cfg.AuditPath, true)
 		if err != nil {
 			return err
 		}
-		r.audit = f
+		sinks = append(sinks, f)
 	}
-	ln, err := net.Listen("tcp", *listen)
+	if cfg.Audit != nil {
+		sinks = append(sinks, cfg.Audit)
+	}
+	if len(sinks) > 0 {
+		r.audit = sinks
+		defer sinks.Close()
+	}
+	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
-	if *adminAddr != "" {
-		if *adminToken == "" {
-			return errors.New("--admin requires --admin-token")
+	var closers []func() error
+	closers = append(closers, ln.Close)
+	if cfg.AdminListen != "" {
+		if cfg.AdminToken == "" {
+			ln.Close()
+			return errors.New("the admin API requires an admin token")
 		}
-		aln, err := net.Listen("tcp", *adminAddr)
+		aln, err := net.Listen("tcp", cfg.AdminListen)
 		if err != nil {
+			ln.Close()
 			return err
 		}
-		go http.Serve(aln, r.adminHandler(*adminToken))
+		closers = append(closers, aln.Close)
+		go http.Serve(aln, r.adminHandler(cfg.AdminToken))
 	}
-	if *wsListen != "" {
-		if err := r.serveWebSocket(*wsListen, *tlsCert, *tlsKey); err != nil {
+	if cfg.WSListen != "" {
+		wln, err := r.serveWebSocket(cfg.WSListen, cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			for _, c := range closers {
+				c()
+			}
 			return err
 		}
+		closers = append(closers, wln.Close)
 	}
-	emit("ready", map[string]any{"addr": ln.Addr().String(), "mode": *mode, "ws": *wsListen})
+	defer context.AfterFunc(ctx, func() {
+		for _, c := range closers {
+			c()
+		}
+	})()
+	cfg.Events("ready", map[string]any{"addr": ln.Addr().String(), "mode": cfg.Mode, "ws": cfg.WSListen})
 	for {
 		c, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return err
 		}
 		if tc, ok := c.(*net.TCPConn); ok {
@@ -150,15 +185,13 @@ func (r *relay) auditEvent(event string, f map[string]any) {
 	if r.audit == nil {
 		return
 	}
-	m := map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano), "event": event}
+	m := audit.Event{"event": event}
 	for k, v := range f {
 		m[k] = v
 	}
-	b, _ := json.Marshal(m)
-	r.auditMu.Lock()
-	r.audit.Write(append(b, '\n'))
-	r.audit.Sync()
-	r.auditMu.Unlock()
+	if err := r.audit.Write(m); err != nil {
+		logf("audit write failed: %v", err)
+	}
 }
 
 func (r *relay) adminHandler(token string) http.Handler {
