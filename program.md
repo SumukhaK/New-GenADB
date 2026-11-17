@@ -1,11 +1,11 @@
 # Autonomous Research Protocol (`program.md`)
 
 ## Objective
-Solve the problem specified in **`remote_adb_research_findings.md` §16** (this replaces the separate `research_draft.md` originally referenced here). The deliverable is a secure, resilient remote-ADB connectivity core (`genadb`: relay, device agent, desktop connect agent/CLI) in `./core`. Iteratively improve it to maximise the `SCORE:` reported by `eval.py`. Higher is better, and the maximum is 100.
+Solve the problem specified in **`docs/research/remote_adb_research_findings.md` §16** (this replaces the separate `research_draft.md` originally referenced here). The deliverable is a secure, resilient remote-ADB connectivity core (`genadb`: relay, device agent, desktop connect agent/CLI) in `./core`. Iteratively improve it to maximise the `SCORE:` reported by `eval.py`. Higher is better, and the maximum is 100.
 
 ## Strict Rules & Safety Constraints
 1. **Editable surface:** You may ONLY modify `solution.py` and files under `core/`, and append logs to `results.tsv`.
-2. **Immutable harness:** You are strictly forbidden from modifying `eval.py`, anything under `harness/`, `program.md`, `remote_adb_research_findings.md`, `reports/` or `research_notes/`. Harness fixes were allowed only during Phase 1.
+2. **Immutable harness:** You are strictly forbidden from modifying `eval.py`, anything under `harness/`, `program.md`, or anything under `docs/research/` (the findings, `reports/` and `notes/`). Harness fixes were allowed only during Phase 1.
 3. **No gaming:**
    - The solution must not read `eval.py` or `harness/`, inspect the test environment, or special-case canary strings, ports, process names or scenario names.
    - Security properties must be real. Use standard primitives (e.g. X25519/Ed25519, HKDF, ChaCha20-Poly1305/AES-GCM, or TLS 1.3/Noise) with no hard-coded keys.
@@ -24,7 +24,7 @@ Maintain a tab-separated file `results.tsv` with these exact columns:
 
 ## Autonomous Loop (Phase 2)
 Repeat the following steps:
-1. **Analyze:** Read `results.tsv`, `remote_adb_research_findings.md` §16, the code in `core/`, and the per-check `CHECK`/`NOTE` lines of the last `run.log`. Form a clear, non-trivial hypothesis about why the current best score is limited and how one specific change will raise it.
+1. **Analyze:** Read `results.tsv`, `docs/research/remote_adb_research_findings.md` §16, the code in `core/`, and the per-check `CHECK`/`NOTE` lines of the last `run.log`. Form a clear, non-trivial hypothesis about why the current best score is limited and how one specific change will raise it.
 2. **Edit:** Implement that single focused change in `core/` (and `solution.py` if needed). Run `go vet ./...` in `core/` before evaluating.
 3. **Commit:** `git add solution.py core && git commit -m "exp <N>: <short hypothesis>"`.
 4. **Evaluate:** `python eval.py > run.log 2>&1`, then extract the final `SCORE:` value from `run.log`.

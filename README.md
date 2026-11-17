@@ -288,6 +288,7 @@ These figures come from the locked evaluation harness (`eval.py`, a simulated WA
 | `android/agent-protocol` | Platform-neutral Kotlin half of the SDK, JVM-tested |
 | `android/app` | Companion app built on the SDK |
 | `eval.py`, `harness/` | Locked evaluation harness |
+| `docs/research/` | Research findings, notes and reports behind the design (locked record) |
 
 ## Building and testing
 

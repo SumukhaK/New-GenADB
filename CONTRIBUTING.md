@@ -45,7 +45,7 @@ The Kotlin SDK is compiled in explicit-API mode. Anything not meant for SDK user
 
 ## The evaluation harness is locked
 
-`eval.py`, `harness/`, `program.md`, `remote_adb_research_findings.md`, `reports/` and `research_notes/` are the fixed benchmark and research record. Do not modify them in pull requests. Improve the product, and record each experiment as a new line appended to `results.tsv`.
+`eval.py`, `harness/`, `program.md`, and everything under `docs/research/` (`remote_adb_research_findings.md`, `reports/` and `notes/`) are the fixed benchmark and research record. Do not modify them in pull requests. Improve the product, and record each experiment as a new line appended to `results.tsv`.
 
 Changes that touch the connectivity core should report the `eval.py` score before and after. The score varies by about ±0.03 between runs, mostly from the throughput check.
 
