@@ -116,7 +116,7 @@ func wsKeepalive(c *websocket.Conn) {
 // of the last successful lookup. Agents reconnect exactly when the network is
 // misbehaving, which is also when DNS is slowest; falling back to the last
 // known addresses keeps a flaky resolver from stretching every reconnect.
-var relayAddrs sync.Map // host -> []string
+var relayAddrs, dnsFallbackWarned sync.Map // host -> []string, host -> bool
 
 func relayDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
@@ -128,8 +128,11 @@ func relayDialContext(ctx context.Context, network, addr string) (net.Conn, erro
 	cancel()
 	if lerr == nil && len(ips) > 0 {
 		relayAddrs.Store(host, ips)
+		dnsFallbackWarned.Delete(host)
 	} else if v, ok := relayAddrs.Load(host); ok {
-		logf("DNS lookup for %s failed (%v); using last known addresses", host, lerr)
+		if _, warned := dnsFallbackWarned.LoadOrStore(host, true); !warned {
+			logf("DNS lookup for %s failed (%v); using last known addresses", host, lerr)
+		}
 		ips = v.([]string)
 	} else {
 		return nil, lerr
