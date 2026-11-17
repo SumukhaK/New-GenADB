@@ -1,0 +1,13 @@
+New-GenADB
+Copyright 2026 SumukhaK (https://github.com)
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes software developed by third parties:
+
+- filippo.io/edwards25519 (BSD-3-Clause), Copyright (c) 2009 The Go Authors
+- github.com/coder/websocket (ISC), Copyright (c) 2025 Coder
+- golang.org/x/net (BSD-3-Clause), Copyright 2009 The Go Authors
+
+The Android SDK depends at runtime on kotlinx-coroutines and the Kotlin
+standard library (Apache-2.0), Copyright JetBrains s.r.o. and contributors.
