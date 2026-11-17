@@ -3,4 +3,5 @@ build/
 */build/
 local.properties
 app/src/main/jniLibs/
+genadb-android/src/main/jniLibs/
 .kotlin/

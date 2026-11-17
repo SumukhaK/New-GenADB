@@ -1,0 +1,2 @@
+{"bytes":42,"device":"dev-\u003cA\u003e\u0026\"x\"","event":"agent_start","event_hash":"ecfaf1b7d320c685cab6cd690b5288cfad9a2580f15f22d5d8d957bda7d5e894","note":"line\nbreak \t é \u2028 \u0001 /","prev_event_hash":"0000000000000000000000000000000000000000000000000000000000000000","role":"device","seq":1,"ts":"2026-01-02T03:04:05Z"}
+{"event":"online","event_hash":"7d13884999a5909e51b9c449d74c5c62e6d9ddff150743c1f4c6f9bd4547c61e","neg":-7,"ok":true,"prev_event_hash":"ecfaf1b7d320c685cab6cd690b5288cfad9a2580f15f22d5d8d957bda7d5e894","seq":2,"ts":"2026-01-02T03:04:06Z"}
