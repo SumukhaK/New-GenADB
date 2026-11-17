@@ -20,9 +20,9 @@ import (
 // Version is the SDK and engine version.
 const Version = engine.Version
 
-// Client manages connections from this machine to remote devices. It is safe
+// SetuClient manages connections from this machine to remote devices. It is safe
 // for concurrent use. Create one with New and release it with Close.
-type Client struct {
+type SetuClient struct {
 	cfg       config
 	events    chan Event
 	sink      audit.Sink // nil when audit is off
@@ -37,7 +37,7 @@ type Client struct {
 	dropped  atomic.Uint64
 
 	mu       sync.Mutex
-	sessions map[string]*Session
+	sessions map[string]*SetuSession
 	seq      int
 	closed   bool
 	closeErr error
@@ -45,7 +45,7 @@ type Client struct {
 
 // New builds a Client. It creates the state directory and, when auditing is
 // enabled, opens the audit log.
-func New(opts ...Option) (*Client, error) {
+func New(opts ...Option) (*SetuClient, error) {
 	cfg := config{mode: ModeSolo, reconnect: DefaultReconnectPolicy, eventBuf: 256}
 	for _, o := range opts {
 		o(&cfg)
@@ -86,7 +86,7 @@ func New(opts ...Option) (*Client, error) {
 	if cfg.logger != nil {
 		engine.SetLogger(cfg.logger)
 	}
-	c := &Client{cfg: cfg, events: make(chan Event, max(cfg.eventBuf, 1)), sessions: map[string]*Session{},
+	c := &SetuClient{cfg: cfg, events: make(chan Event, max(cfg.eventBuf, 1)), sessions: map[string]*SetuSession{},
 		dispatch: make(chan Event, dispatchBuffer), quit: make(chan struct{}), dispDone: make(chan struct{})}
 	go c.dispatcher()
 	if c.auditEnabled() {
@@ -97,7 +97,7 @@ func New(opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-func (c *Client) auditEnabled() bool {
+func (c *SetuClient) auditEnabled() bool {
 	switch c.cfg.audit.Mode {
 	case AuditOn:
 		return true
@@ -107,7 +107,7 @@ func (c *Client) auditEnabled() bool {
 	return c.cfg.mode == ModeCorporate
 }
 
-func (c *Client) openAudit() error {
+func (c *SetuClient) openAudit() error {
 	c.auditPath = c.cfg.audit.Path
 	if c.auditPath == "" {
 		c.auditPath = filepath.Join(c.cfg.state, "audit.jsonl")
@@ -132,7 +132,7 @@ func (c *Client) openAudit() error {
 }
 
 // eventTap republishes sealed audit records as EventAudit events.
-type eventTap struct{ c *Client }
+type eventTap struct{ c *SetuClient }
 
 func (t eventTap) Write(e audit.Event) error {
 	t.c.emit(Event{Type: EventAudit, Fields: e})
@@ -141,28 +141,28 @@ func (t eventTap) Write(e audit.Event) error {
 func (eventTap) Close() error { return nil }
 
 // Mode reports the client's operating mode.
-func (c *Client) Mode() Mode { return c.cfg.mode }
+func (c *SetuClient) Mode() Mode { return c.cfg.mode }
 
 // StateDir reports where keys, pins and the default audit log live.
-func (c *Client) StateDir() string { return c.cfg.state }
+func (c *SetuClient) StateDir() string { return c.cfg.state }
 
 // AuditPath is the audit log file, or "" when auditing is off.
-func (c *Client) AuditPath() string { return c.auditPath }
+func (c *SetuClient) AuditPath() string { return c.auditPath }
 
 // AuditAnchorKeyFile returns the configured anchor key file ("" = the default
 // next to the log).
-func (c *Client) AuditAnchorKeyFile() string { return c.cfg.audit.AnchorKeyFile }
+func (c *SetuClient) AuditAnchorKeyFile() string { return c.cfg.audit.AnchorKeyFile }
 
 // Events returns the event channel. Events are dropped, not queued, when the
 // reader falls behind; use WithEventHandler for lossless delivery.
-func (c *Client) Events() <-chan Event { return c.events }
+func (c *SetuClient) Events() <-chan Event { return c.events }
 
 // dispatchBuffer is how many events may wait for a slow handler before
 // new ones are dropped (counted by DroppedEvents).
 const dispatchBuffer = 4096
 
 // emit never blocks.
-func (c *Client) emit(e Event) {
+func (c *SetuClient) emit(e Event) {
 	if e.Time.IsZero() {
 		e.Time = time.Now()
 	}
@@ -173,7 +173,7 @@ func (c *Client) emit(e Event) {
 	}
 }
 
-func (c *Client) deliver(e Event) {
+func (c *SetuClient) deliver(e Event) {
 	if c.cfg.onEvent != nil {
 		c.cfg.onEvent(e)
 	}
@@ -184,7 +184,7 @@ func (c *Client) deliver(e Event) {
 	}
 }
 
-func (c *Client) dispatcher() {
+func (c *SetuClient) dispatcher() {
 	defer close(c.dispDone)
 	for {
 		select {
@@ -206,19 +206,19 @@ func (c *Client) dispatcher() {
 // DroppedEvents counts events discarded because the event handler or the
 // Events channel reader fell behind. Audit records are never dropped from
 // the audit log itself, only from the event stream.
-func (c *Client) DroppedEvents() uint64 { return c.dropped.Load() }
+func (c *SetuClient) DroppedEvents() uint64 { return c.dropped.Load() }
 
 // PublicKey returns this machine's identity public key (creating the key on
 // first use). Corporate token issuers bind user tokens to it.
-func (c *Client) PublicKey() (string, error) { return engine.Keygen(c.cfg.state) }
+func (c *SetuClient) PublicKey() (string, error) { return engine.Keygen(c.cfg.state) }
 
 // Devices lists devices from the configured DeviceDiscoverer.
-func (c *Client) Devices(ctx context.Context) ([]DeviceInfo, error) {
+func (c *SetuClient) Devices(ctx context.Context) ([]DeviceInfo, error) {
 	return c.cfg.discoverer.Devices(ctx)
 }
 
 // Forget removes the pairing pin for a device.
-func (c *Client) Forget(deviceID string) error { return engine.ForgetDevice(c.cfg.state, deviceID) }
+func (c *SetuClient) Forget(deviceID string) error { return engine.ForgetDevice(c.cfg.state, deviceID) }
 
 // ConnectRequest describes a session to start.
 type ConnectRequest struct {
@@ -234,7 +234,7 @@ type ConnectRequest struct {
 // local adb endpoint is listening, or with the first error: a wrong, mistyped
 // or expired code fails fast with ErrBadCode. Once up, the session runs until
 // Stop or Client.Close, and transient failures are retried per ReconnectPolicy.
-func (c *Client) Connect(ctx context.Context, req ConnectRequest) (*Session, error) {
+func (c *SetuClient) Connect(ctx context.Context, req ConnectRequest) (*SetuSession, error) {
 	if c.cfg.relay == "" {
 		return nil, ErrNoRelay
 	}
@@ -251,7 +251,7 @@ func (c *Client) Connect(ctx context.Context, req ConnectRequest) (*Session, err
 	c.mu.Unlock()
 
 	sctx, cancel := context.WithCancel(context.Background())
-	s := &Session{id: id, c: c, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}),
+	s := &SetuSession{id: id, c: c, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}),
 		deviceID: req.DeviceID, started: time.Now()}
 	go s.run(sctx, req)
 
@@ -279,7 +279,7 @@ func (c *Client) Connect(ctx context.Context, req ConnectRequest) (*Session, err
 }
 
 // Session returns a live session by id.
-func (c *Client) Session(id string) (*Session, bool) {
+func (c *SetuClient) Session(id string) (*SetuSession, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s, ok := c.sessions[id]
@@ -287,9 +287,9 @@ func (c *Client) Session(id string) (*Session, bool) {
 }
 
 // Sessions lists live sessions, oldest first.
-func (c *Client) Sessions() []*Session {
+func (c *SetuClient) Sessions() []*SetuSession {
 	c.mu.Lock()
-	out := make([]*Session, 0, len(c.sessions))
+	out := make([]*SetuSession, 0, len(c.sessions))
 	for _, s := range c.sessions {
 		out = append(out, s)
 	}
@@ -298,7 +298,7 @@ func (c *Client) Sessions() []*Session {
 	return out
 }
 
-func (c *Client) drop(s *Session) {
+func (c *SetuClient) drop(s *SetuSession) {
 	c.mu.Lock()
 	delete(c.sessions, s.id)
 	c.mu.Unlock()
@@ -307,7 +307,7 @@ func (c *Client) drop(s *Session) {
 // ExportAuditReport writes the audit log as a report. JSON and HTML reports
 // include chain verification, per-user / per-device / per-operation totals,
 // sessions and denials; CSV is one row per record.
-func (c *Client) ExportAuditReport(w io.Writer, f audit.Format, opt audit.Options) error {
+func (c *SetuClient) ExportAuditReport(w io.Writer, f audit.Format, opt audit.Options) error {
 	if c.auditPath == "" {
 		return ErrAuditDisabled
 	}
@@ -322,14 +322,14 @@ func (c *Client) ExportAuditReport(w io.Writer, f audit.Format, opt audit.Option
 }
 
 // Close stops every session and closes the audit log.
-func (c *Client) Close() error {
+func (c *SetuClient) Close() error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return c.closeErr
 	}
 	c.closed = true
-	ss := make([]*Session, 0, len(c.sessions))
+	ss := make([]*SetuSession, 0, len(c.sessions))
 	for _, s := range c.sessions {
 		ss = append(ss, s)
 	}
@@ -349,10 +349,10 @@ func (c *Client) Close() error {
 	return c.closeErr
 }
 
-// Session is one device exposed as a local adb endpoint.
-type Session struct {
+// SetuSession is one device exposed as a local adb endpoint.
+type SetuSession struct {
 	id      string
-	c       *Client
+	c       *SetuClient
 	cancel  context.CancelFunc
 	started time.Time
 
@@ -367,27 +367,27 @@ type Session struct {
 }
 
 // ID is the client-unique session id.
-func (s *Session) ID() string { return s.id }
+func (s *SetuSession) ID() string { return s.id }
 
 // ADBAddr is the local endpoint to pass to `adb connect`.
-func (s *Session) ADBAddr() string { s.mu.Lock(); defer s.mu.Unlock(); return s.addr }
+func (s *SetuSession) ADBAddr() string { s.mu.Lock(); defer s.mu.Unlock(); return s.addr }
 
 // DeviceID is the remote device.
-func (s *Session) DeviceID() string { s.mu.Lock(); defer s.mu.Unlock(); return s.deviceID }
+func (s *SetuSession) DeviceID() string { s.mu.Lock(); defer s.mu.Unlock(); return s.deviceID }
 
 // Started is when the session was requested.
-func (s *Session) Started() time.Time { return s.started }
+func (s *SetuSession) Started() time.Time { return s.started }
 
 // Done is closed when the session has ended.
-func (s *Session) Done() <-chan struct{} { return s.done }
+func (s *SetuSession) Done() <-chan struct{} { return s.done }
 
 // Err is why the session ended (nil after Stop).
-func (s *Session) Err() error { <-s.done; return s.err }
+func (s *SetuSession) Err() error { <-s.done; return s.err }
 
 // Stop ends the session and waits for it to shut down.
-func (s *Session) Stop() { s.cancel(); <-s.done }
+func (s *SetuSession) Stop() { s.cancel(); <-s.done }
 
-func (s *Session) run(ctx context.Context, req ConnectRequest) {
+func (s *SetuSession) run(ctx context.Context, req ConnectRequest) {
 	defer close(s.done)
 	defer s.c.drop(s)
 	pol := s.c.cfg.reconnect
@@ -430,7 +430,7 @@ func (s *Session) run(ctx context.Context, req ConnectRequest) {
 	}
 }
 
-func (s *Session) runOnce(ctx context.Context, req ConnectRequest, code string) error {
+func (s *SetuSession) runOnce(ctx context.Context, req ConnectRequest, code string) error {
 	cfg := engine.DesktopConfig{
 		Relay:  s.c.cfg.relay,
 		State:  s.c.cfg.state,

@@ -53,7 +53,7 @@ type DoctorOptions struct {
 }
 
 // Doctor runs Diagnose with this client's configuration.
-func (c *Client) Doctor(ctx context.Context) DoctorReport {
+func (c *SetuClient) Doctor(ctx context.Context) DoctorReport {
 	return Diagnose(ctx, DoctorOptions{StateDir: c.cfg.state, Relay: c.cfg.relay, AuditPath: c.auditPath, Transport: c.cfg.transport})
 }
 
