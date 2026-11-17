@@ -12,8 +12,8 @@ android {
         applicationId = "dev.genadb.companion"
         minSdk = 29 // Android 10: legacy tcpip; Wireless debugging (TLS) needs 30+
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.4.0"
+        versionCode = 2
+        versionName = "1.0.1"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
     buildFeatures { compose = true }

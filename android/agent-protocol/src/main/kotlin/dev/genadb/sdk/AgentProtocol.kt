@@ -2,16 +2,16 @@ package dev.genadb.sdk
 
 import org.json.JSONObject
 
-/** Effective agent settings after merging [GenAdbConfig] with [ManagedPolicy]. */
+/** Effective agent settings after merging [SetuConfig] with [ManagedPolicy]. */
 internal data class EffectiveConfig(
-    val config: GenAdbConfig,
+    val config: SetuConfig,
     val policy: PolicyStatus,
     val relayPin: String?,
     val enrollmentToken: String?,
     val policyJson: String?,
 )
 
-internal fun effective(cfg: GenAdbConfig, managed: ManagedPolicy): EffectiveConfig {
+internal fun effective(cfg: SetuConfig, managed: ManagedPolicy): EffectiveConfig {
     val enroll = managed.enrollmentToken?.takeIf { it.isNotBlank() } ?: cfg.enrollmentToken
     val mode = if (!managed.enrollmentToken.isNullOrBlank()) Mode.CORPORATE else cfg.mode
     val relay = managed.relayUrl?.takeIf { it.isNotBlank() } ?: cfg.relayUrl
