@@ -226,8 +226,9 @@ type ConnectRequest struct {
 }
 
 // Connect pairs if a code is given, verifies the device, and returns once its
-// local adb endpoint is listening. The session runs until Stop, Client.Close
-// or ctx is cancelled; transient failures are retried per ReconnectPolicy.
+// local adb endpoint is listening, or with the first error: a wrong, mistyped
+// or expired code fails fast with ErrBadCode. Once up, the session runs until
+// Stop or Client.Close, and transient failures are retried per ReconnectPolicy.
 func (c *Client) Connect(ctx context.Context, req ConnectRequest) (*Session, error) {
 	if c.cfg.relay == "" {
 		return nil, ErrNoRelay
@@ -255,6 +256,9 @@ func (c *Client) Connect(ctx context.Context, req ConnectRequest) (*Session, err
 		return nil, s.err
 	case <-ctx.Done():
 		s.Stop()
+		if s.err != nil {
+			return nil, fmt.Errorf("%w (last error: %w)", ctx.Err(), s.err)
+		}
 		return nil, ctx.Err()
 	}
 	c.mu.Lock()
@@ -393,6 +397,16 @@ func (s *Session) run(ctx context.Context, req ConnectRequest) {
 		// A pairing code is single-use: after pairing, reconnect by device id.
 		if s.DeviceID() != "" {
 			code, req.DeviceID = "", s.DeviceID()
+		}
+		// Before the first "listening" the caller is still inside Connect:
+		// fail fast with the real error (bad code, not paired, relay down)
+		// instead of retrying behind its back. The policy covers live sessions.
+		select {
+		case <-s.ready:
+		default:
+			s.err = err
+			s.c.emit(Event{Type: EventSessionDown, Session: s.id, Fields: map[string]any{"error": errText(err)}})
+			return
 		}
 		retry := !errors.Is(err, ErrDenied) && (pol.MaxAttempts == 0 || attempt < pol.MaxAttempts)
 		if !retry {

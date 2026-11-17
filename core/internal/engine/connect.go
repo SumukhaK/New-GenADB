@@ -244,6 +244,9 @@ func (a *desktopAgent) recordOp(op adbOp) {
 // attempt. Denials are never retried.
 const establishWait = 8 * time.Second
 
+// rendezvousTimeout bounds the hello exchange with the relay.
+const rendezvousTimeout = 20 * time.Second
+
 func (a *desktopAgent) establishPatiently(id, lan string, params initiatorParams) (*secureConn, string, error) {
 	deadline := time.Now().Add(establishWait)
 	backoff := 200 * time.Millisecond
@@ -328,13 +331,25 @@ func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, 
 	}
 	br := bufio.NewReader(c)
 	h.Identity = a.token
+	// A relay that accepts the connection but never answers must not hang
+	// the caller: bound the whole rendezvous exchange.
+	c.SetDeadline(time.Now().Add(rendezvousTimeout))
 	rep, err := relayHello(c, br, h, a.key)
+	c.SetDeadline(time.Time{})
 	if err != nil {
 		c.Close()
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			return nil, nil, reply{}, fmt.Errorf("%w: relay did not answer within %s", ErrUnavailable, rendezvousTimeout)
+		}
 		return nil, nil, reply{}, err
 	}
 	if !rep.OK {
 		c.Close()
+		if h.Code != "" && rep.Reason == "unknown device or code" {
+			// The nameplate is unknown: the code was mistyped, has expired, or
+			// was burned after failed attempts. Retrying cannot help.
+			return nil, nil, reply{}, fmt.Errorf("%w: %w: code not recognised (mistyped or expired; get a fresh code from the phone)", ErrDenied, ErrBadCode)
+		}
 		switch rep.Reason {
 		case "device offline", "unknown device or code", "device did not answer", "device busy", "rate limited":
 			return nil, nil, reply{}, fmt.Errorf("%w: %s", ErrUnavailable, rep.Reason)

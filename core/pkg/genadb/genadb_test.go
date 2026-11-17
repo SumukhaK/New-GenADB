@@ -453,3 +453,59 @@ func TestBlockedEventConsumersDoNotStallTunnels(t *testing.T) {
 	}
 	t.Logf("%d x 1 MiB pushes in %v with a blocked handler and a stalled subscriber (%d events dropped)", pushes, elapsed, c.DroppedEvents())
 }
+
+// Regression: a mistyped or expired pairing code must fail fast with
+// ErrBadCode, even with a context that never ends.
+func TestBadPairingCodesFailFast(t *testing.T) {
+	w := startWorld(t)
+	c, err := genadb.New(genadb.WithRelayURL(w.relay), genadb.WithStateDir(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	connect := func(code string) error {
+		res := make(chan error, 1)
+		go func() {
+			_, err := c.Connect(context.Background(), genadb.ConnectRequest{PairingCode: code})
+			res <- err
+		}()
+		select {
+		case err := <-res:
+			return err
+		case <-time.After(10 * time.Second):
+			t.Fatalf("Connect(%q) hung", code)
+			return nil
+		}
+	}
+	nameplate, secret, _ := strings.Cut(w.code, "-")
+	other := "1"
+	if strings.HasPrefix(nameplate, "1") {
+		other = "2"
+	}
+	mistypedNameplate := other + nameplate[1:] + "-" + secret
+
+	for _, code := range []string{mistypedNameplate, "garbage"} {
+		if err := connect(code); !errors.Is(err, genadb.ErrBadCode) || !errors.Is(err, genadb.ErrDenied) {
+			t.Fatalf("mistyped code %q: %v", code, err)
+		}
+	}
+	// Wrong secret: rejected by the end-to-end check.
+	wrong := nameplate + "-" + strings.Repeat("0", len(secret))
+	if wrong == w.code {
+		wrong = nameplate + "-" + strings.Repeat("1", len(secret))
+	}
+	for i := 0; i < 3; i++ {
+		if err := connect(wrong); !errors.Is(err, genadb.ErrBadCode) {
+			t.Fatalf("wrong secret (attempt %d): %v", i+1, err)
+		}
+	}
+	// After repeated failures the device burns the code: the once-valid code
+	// has now expired and must fail fast too.
+	start := time.Now()
+	if err := connect(w.code); !errors.Is(err, genadb.ErrBadCode) {
+		t.Fatalf("expired code: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("expired code took %v", d)
+	}
+}

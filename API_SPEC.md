@@ -44,7 +44,7 @@ func (c *Client) Close() error                               // stops sessions, 
 | `PairingCode` | The code shown on the phone, `NNNN-XXXXXX`. Pairs first, then connects (solo only) |
 | `Listen` | Local adb endpoint. The default is `127.0.0.1:0`, which picks any free port |
 
-`Connect` returns once the local endpoint is listening, or with the first error. It is bounded by `ctx` and by the reconnect policy.
+`Connect` returns once the local endpoint is listening, or with the first error; it never retries before the session is up. A mistyped, expired or burned pairing code fails fast with `ErrBadCode`, and a relay that does not answer within 20 s fails with `ErrUnavailable`. If `ctx` ends first, the error wraps `ctx.Err()` and the last session error.
 
 ### 1.2 Session
 
@@ -70,7 +70,7 @@ When a session is restarted under its reconnect policy, it keeps the same `ADBAd
 | `WithCorporateToken(token, policyPath)` | n/a | Implies corporate mode |
 | `WithAuthProvider(p, policyPath)` | n/a | Corporate mode with a refreshing token source |
 | `WithAuditConfig(AuditConfig)` | `AuditAuto` | See below |
-| `WithReconnectPolicy(ReconnectPolicy)` | `DefaultReconnectPolicy` (forever, 1 s to 30 s backoff) | `NoReconnect` fails fast. Denials are never retried |
+| `WithReconnectPolicy(ReconnectPolicy)` | `DefaultReconnectPolicy` (forever, 1 s to 30 s backoff) | Restarts a session that was up and then failed. `NoReconnect` ends it instead. Denials are never retried |
 | `WithTransportOptions(TransportOptions{Proxy, CAFile, Pin})` | environment proxy | For ws and wss relays |
 | `WithTransport(TransportProvider)` | built-in | Replaces the relay dialer |
 | `WithDeviceDiscoverer(DeviceDiscoverer)` | paired devices in the state directory | |
