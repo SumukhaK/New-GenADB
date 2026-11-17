@@ -83,7 +83,7 @@ func TestReports(t *testing.T) {
 	writeLog(t, p, sample()...)
 	ev, _ := ReadFile(p)
 	r := Build(ev, Options{})
-	if !r.Chain.Valid || r.Totals.Operations != 2 || r.Totals.Denied != 1 || r.Totals.Sessions != 1 || r.Totals.BytesUp != 1048586 {
+	if !r.Chain.Valid || r.Totals.Operations != 2 || r.Totals.Denials != 1 || r.Totals.Sessions != 1 || r.Totals.BytesUp != 1048586 {
 		t.Fatalf("totals: %+v chain %+v", r.Totals, r.Chain)
 	}
 	if len(r.Sessions) != 1 || r.Sessions[0].Operations != 2 || r.Sessions[0].Transport != "relay-wss" || r.Sessions[0].EndReason != "revoked" {
@@ -160,7 +160,7 @@ func TestWebhookSigned(t *testing.T) {
 func TestSinceFilter(t *testing.T) {
 	ev := []Event{{"event": "denied", "ts": "2026-01-01T00:00:00Z"}, {"event": "denied", "ts": "2026-06-01T00:00:00Z"}}
 	r := Build(ev, Options{Since: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)})
-	if r.Totals.Denied != 1 {
+	if r.Totals.Denials != 1 {
 		t.Fatalf("since filter: %+v", r.Totals)
 	}
 }

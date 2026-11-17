@@ -30,31 +30,36 @@ func ParseFormat(s string) (Format, error) {
 	return "", errorf("unknown report format %q (want json, csv or html)", s)
 }
 
-// Report is the summary an admin exports.
+// Report is the summary an admin exports. Its JSON form is the schema in
+// API_SPEC.md section 3.2 (checked by TestReportMatchesAPISpec).
 type Report struct {
 	GeneratedAt string           `json:"generated_at"`
 	Source      string           `json:"source,omitempty"`
+	Since       string           `json:"since,omitempty"`       // filter lower bound, if any
+	Until       string           `json:"until,omitempty"`       // filter upper bound, if any
+	FirstEvent  string           `json:"first_event,omitempty"` // ts of the first record included
+	LastEvent   string           `json:"last_event,omitempty"`  // ts of the last record included
 	Chain       ChainStatus      `json:"chain"`
-	From        string           `json:"from,omitempty"`
-	To          string           `json:"to,omitempty"`
 	Totals      Totals           `json:"totals"`
 	ByUser      []Group          `json:"by_user"`
 	ByDevice    []Group          `json:"by_device"`
-	ByOp        []Group          `json:"by_operation"`
-	Denials     []Denial         `json:"denials"`
+	ByOp        []Group          `json:"by_op"`
 	Sessions    []SessionSummary `json:"sessions"`
+	Denials     []Denial         `json:"denials"`
 	Events      []Event          `json:"events,omitempty"`
 }
 
-// Totals counts events across the whole log.
+// Totals counts records across the (filtered) log.
 type Totals struct {
-	Events     int   `json:"events"`
-	Sessions   int   `json:"sessions"`
-	Operations int   `json:"operations"`
-	Denied     int   `json:"denied"`
-	Revoked    int   `json:"revoked"`
-	BytesUp    int64 `json:"bytes_up"`
-	BytesDown  int64 `json:"bytes_down"`
+	Records     int   `json:"records"`
+	Sessions    int   `json:"sessions"`
+	Operations  int   `json:"operations"`
+	Denials     int   `json:"denials"`
+	Revocations int   `json:"revocations"`
+	BytesUp     int64 `json:"bytes_up"`
+	BytesDown   int64 `json:"bytes_down"`
+	Users       int   `json:"users"`
+	Devices     int   `json:"devices"`
 }
 
 // Group aggregates activity for one user, device or operation.
@@ -62,7 +67,7 @@ type Group struct {
 	Key        string `json:"key"`
 	Sessions   int    `json:"sessions"`
 	Operations int    `json:"operations"`
-	Denied     int    `json:"denied"`
+	Denials    int    `json:"denials"`
 	BytesUp    int64  `json:"bytes_up"`
 	BytesDown  int64  `json:"bytes_down"`
 }
@@ -130,6 +135,12 @@ func num(e Event, k string) int64 {
 // any time filter is applied.
 func Build(events []Event, opt Options) Report {
 	r := Report{GeneratedAt: time.Now().UTC().Format(time.RFC3339), Source: opt.Source, Chain: Verify(events)}
+	if !opt.Since.IsZero() {
+		r.Since = opt.Since.UTC().Format(time.RFC3339)
+	}
+	if !opt.Until.IsZero() {
+		r.Until = opt.Until.UTC().Format(time.RFC3339)
+	}
 	users, devices, ops := map[string]*Group{}, map[string]*Group{}, map[string]*Group{}
 	sessions := map[string]*SessionSummary{}
 	var order []string
@@ -176,13 +187,13 @@ func Build(events []Event, opt Options) Report {
 				continue
 			}
 		}
-		if r.From == "" || ts < r.From {
-			r.From = ts
+		if r.FirstEvent == "" || ts < r.FirstEvent {
+			r.FirstEvent = ts
 		}
-		if ts > r.To {
-			r.To = ts
+		if ts > r.LastEvent {
+			r.LastEvent = ts
 		}
-		r.Totals.Events++
+		r.Totals.Records++
 		if opt.IncludeEvents {
 			r.Events = append(r.Events, e)
 		}
@@ -218,17 +229,18 @@ func Build(events []Event, opt Options) Report {
 				s.Operations++
 			}
 		case "denied":
-			r.Totals.Denied++
-			group(users, user).Denied++
+			r.Totals.Denials++
+			group(users, user).Denials++
 			if dev != "" {
-				group(devices, dev).Denied++
+				group(devices, dev).Denials++
 			}
 			r.Denials = append(r.Denials, Denial{TS: ts, User: user, Device: dev, Reason: str(e, "reason")})
 		case "revoked":
-			r.Totals.Revoked++
+			r.Totals.Revocations++
 		}
 	}
 	r.ByUser, r.ByDevice, r.ByOp = sorted(users), sorted(devices), sorted(ops)
+	r.Totals.Users, r.Totals.Devices = countKnown(users), countKnown(devices)
 	for _, id := range order {
 		r.Sessions = append(r.Sessions, *sessions[id])
 	}
@@ -239,6 +251,14 @@ func Build(events []Event, opt Options) Report {
 		r.Sessions = []SessionSummary{}
 	}
 	return r
+}
+
+func countKnown(m map[string]*Group) int {
+	n := len(m)
+	if _, ok := m["(unknown)"]; ok {
+		n--
+	}
+	return n
 }
 
 func sorted(m map[string]*Group) []Group {
@@ -266,12 +286,14 @@ func Export(w io.Writer, events []Event, f Format, opt Options) error {
 	return errorf("unknown format %q", f)
 }
 
-var csvColumns = []string{"seq", "ts", "event", "user", "token_id", "device", "session", "role", "transport",
-	"op", "path", "command", "bytes_up", "bytes_down", "duration_ms", "sha256", "reason", "prev_event_hash", "event_hash"}
+// CSVColumns is the fixed CSV header (API_SPEC.md section 3.2).
+var CSVColumns = []string{"seq", "ts", "event", "role", "user", "token_id", "device", "session", "transport",
+	"op", "path", "command", "sha256", "bytes_up", "bytes_down", "duration_ms", "result", "reason",
+	"prev_event_hash", "event_hash"}
 
 func writeCSV(w io.Writer, events []Event, opt Options) error {
 	cw := csv.NewWriter(w)
-	if err := cw.Write(csvColumns); err != nil {
+	if err := cw.Write(CSVColumns); err != nil {
 		return err
 	}
 	for _, e := range events {
@@ -280,8 +302,8 @@ func writeCSV(w io.Writer, events []Event, opt Options) error {
 				continue
 			}
 		}
-		row := make([]string, len(csvColumns))
-		for i, c := range csvColumns {
+		row := make([]string, len(CSVColumns))
+		for i, c := range CSVColumns {
 			row[i] = csvSafe(str(e, c))
 		}
 		if err := cw.Write(row); err != nil {
@@ -315,13 +337,13 @@ table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.35rem .
 th{font-weight:600;background:#f6f7f9}td.n{text-align:right;font-variant-numeric:tabular-nums}
 </style></head><body>
 <h1>GenADB audit report</h1>
-<div class="muted">Generated {{.GeneratedAt}}{{if .Source}} from {{.Source}}{{end}}{{if .From}} · events {{.From}} to {{.To}}{{end}}</div>
+<div class="muted">Generated {{.GeneratedAt}}{{if .Source}} from {{.Source}}{{end}}{{if .FirstEvent}} · records {{.FirstEvent}} to {{.LastEvent}}{{end}}</div>
 <p>Integrity: {{if .Chain.Valid}}<span class="ok">hash chain intact</span> ({{.Chain.Records}} records){{else}}<span class="bad">hash chain BROKEN at record {{.Chain.BrokenAt}}: {{.Chain.Problem}}</span>{{end}}</p>
 <div class="tiles">
 <div class="tile"><b>{{.Totals.Sessions}}</b>sessions</div>
 <div class="tile"><b>{{.Totals.Operations}}</b>adb operations</div>
-<div class="tile"><b>{{.Totals.Denied}}</b>denied attempts</div>
-<div class="tile"><b>{{.Totals.Revoked}}</b>revocations</div>
+<div class="tile"><b>{{.Totals.Denials}}</b>denied attempts</div>
+<div class="tile"><b>{{.Totals.Revocations}}</b>revocations</div>
 <div class="tile"><b>{{bytes .Totals.BytesUp}}</b>to devices</div>
 <div class="tile"><b>{{bytes .Totals.BytesDown}}</b>from devices</div>
 </div>
@@ -337,8 +359,8 @@ th{font-weight:600;background:#f6f7f9}td.n{text-align:right;font-variant-numeric
 {{range .Denials}}<tr><td>{{.TS}}</td><td>{{.User}}</td><td>{{.Device}}</td><td>{{.Reason}}</td></tr>
 {{else}}<tr><td colspan="4" class="muted">None.</td></tr>{{end}}</table>
 </body></html>
-{{define "groups"}}<table><tr><th></th><th>Sessions</th><th>Operations</th><th>Denied</th><th>Up</th><th>Down</th></tr>
-{{range .}}<tr><td>{{.Key}}</td><td class="n">{{.Sessions}}</td><td class="n">{{.Operations}}</td><td class="n">{{.Denied}}</td><td class="n">{{bytes .BytesUp}}</td><td class="n">{{bytes .BytesDown}}</td></tr>
+{{define "groups"}}<table><tr><th></th><th>Sessions</th><th>Operations</th><th>Denials</th><th>Up</th><th>Down</th></tr>
+{{range .}}<tr><td>{{.Key}}</td><td class="n">{{.Sessions}}</td><td class="n">{{.Operations}}</td><td class="n">{{.Denials}}</td><td class="n">{{bytes .BytesUp}}</td><td class="n">{{bytes .BytesDown}}</td></tr>
 {{else}}<tr><td colspan="6" class="muted">None.</td></tr>{{end}}</table>{{end}}`))
 
 func writeHTML(w io.Writer, r Report) error { return htmlTmpl.Execute(w, r) }

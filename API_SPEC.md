@@ -256,7 +256,7 @@ Records are stored one JSON object per line. Every record has these fields:
 | `prev_event_hash` | hex string | `event_hash` of the previous record; 64 zeros for the first |
 | `event_hash` | hex string | SHA-256 of the record's canonical JSON without `event_hash` |
 
-Canonical JSON means compact JSON, object keys sorted, and Go `encoding/json` string escaping (`<`, `>` and `&` are escaped as `<`, `>` and `&`). Integers are written as plain numbers. The Go and Kotlin implementations produce identical bytes.
+Canonical JSON means compact JSON, object keys sorted, and Go `encoding/json` string escaping: `<`, `>` and `&` are written as `\u003c`, `\u003e` and `\u0026`. Integers are written as plain numbers. The Go and Kotlin implementations produce identical bytes.
 
 Common optional fields are `role` (`relay`, `desktop` or `device`), `user` (token subject), `token_id` (token ID claim; never the token), `device`, `session` (opaque tunnel ID) and `ip`.
 
@@ -265,7 +265,9 @@ Common optional fields are `role` (`relay`, `desktop` or `device`), `user` (toke
 | `session_start` | desktop, relay | `transport`: `lan`, `relay-tcp`, `relay-ws` or `relay-wss` |
 | `session_end` | desktop, relay | `transport`, `bytes_up`, `bytes_down`, `duration_ms`, `reason` |
 | `adb_op` | desktop | `op`, `path?`, `command?`, `sha256?`, `bytes_up`, `bytes_down`, `duration_ms`, `result?` (`failed`) |
-| `session_denied`, `revoked`, other relay events | relay | `reason` |
+| `denied` | relay | `user?`, `device?`, `reason` |
+| `revoked` | relay (admin API) | `user?`, `device?`, `sessions_killed` |
+| `rate_limited`, `device_online`, `device_offline` | relay | `role`, `kind`, `device` |
 | `agent_start`, `online`, `pairing_code_issued`, `adbd_endpoint`, `adbd_unreachable`, `blocked`, `policy_missing`, `agent_error`, `agent_exit`, `agent_stop` | device (Android SDK) | `mode`, `transport`, `reason`, `addr`, `exit_code`, `missing` |
 
 `op` values:
@@ -288,29 +290,47 @@ Never recorded: tokens, pairing codes, passwords, command arguments, environment
 
 ### 3.2 Report (JSON)
 
+`genadb audit report --format json`, `Client.ExportAuditReport(…, audit.FormatJSON, …)` and the daemon's `audit.report` all produce this object. The example below is checked field for field against the code by `TestReportMatchesAPISpec` (`core/pkg/genadb/audit`), so it is the contract.
+
 ```json
 {
-  "generated_at": "…", "source": "audit.jsonl", "since": "…", "until": "…",
-  "chain": { "valid": true, "records": 812, "last_hash": "…" },
-  "totals": { "records": 812, "sessions": 40, "operations": 655, "denials": 3,
-              "bytes_up": 0, "bytes_down": 0, "users": 4, "devices": 6 },
-  "by_user":   [ { "key": "alice", "sessions": 10, "operations": 200, "bytes_up": 0, "bytes_down": 0, "denials": 0 } ],
-  "by_device": [ … ],
-  "by_op":     [ … ],
-  "sessions":  [ { "session": "…", "user": "…", "device": "…", "transport": "relay-wss",
-                   "start": "…", "end": "…", "end_reason": "…", "operations": 12, "bytes_up": 0, "bytes_down": 0 } ],
-  "denials":   [ { "ts": "…", "user": "…", "device": "…", "reason": "…" } ],
-  "events":    [ … ]
+  "generated_at": "2026-11-17T09:00:00Z",
+  "source": "audit.jsonl",
+  "since": "2026-11-10T00:00:00Z",
+  "until": "2026-11-17T00:00:00Z",
+  "first_event": "2026-11-10T08:00:00Z",
+  "last_event": "2026-11-16T18:30:00Z",
+  "chain": { "valid": true, "records": 812, "broken_at": 0, "problem": "", "last_hash": "9f2c…", "unchained": 0 },
+  "totals": { "records": 812, "sessions": 40, "operations": 655, "denials": 3, "revocations": 1,
+              "bytes_up": 734003200, "bytes_down": 52428800, "users": 4, "devices": 6 },
+  "by_user":   [ { "key": "alice", "sessions": 10, "operations": 200, "denials": 0, "bytes_up": 1048576, "bytes_down": 2048 } ],
+  "by_device": [ { "key": "pixel-7", "sessions": 10, "operations": 200, "denials": 1, "bytes_up": 1048576, "bytes_down": 2048 } ],
+  "by_op":     [ { "key": "push", "sessions": 0, "operations": 120, "denials": 0, "bytes_up": 1048576, "bytes_down": 0 } ],
+  "sessions":  [ { "session": "4be1c0d2a9f37e11", "user": "alice", "device": "pixel-7", "transport": "relay-wss",
+                   "start": "2026-11-16T09:00:00Z", "end": "2026-11-16T09:45:00Z", "end_reason": "closed",
+                   "operations": 12, "bytes_up": 1048576, "bytes_down": 2048 } ],
+  "denials":   [ { "ts": "2026-11-16T10:00:00Z", "user": "bob", "device": "pixel-7", "reason": "no grant for device" } ],
+  "events":    [ { "seq": 1, "ts": "2026-11-10T08:00:00Z", "event": "session_start", "prev_event_hash": "0000…", "event_hash": "ab12…" } ]
 }
 ```
 
-`events` is present only with `include_events`. The CSV format has one row per record, with fixed columns:
+Field notes:
 
-```
-seq, ts, event, role, user, token_id, device, session, transport, op, path, command, sha256, bytes_up, bytes_down, duration_ms, result, reason, event_hash
+- `since` and `until` echo the filter and are omitted when it is unbounded. `first_event` and `last_event` are the timestamps of the first and last records included.
+- `chain` is the chain status (section 3.3). Fields that are zero or empty are omitted.
+- `totals.bytes_up` and `totals.bytes_down` add up `adb_op` records. `totals.users` and `totals.devices` count distinct named users and devices.
+- `by_user`, `by_device` and `by_op` are sorted by `key`. Records without a user or device are grouped under `(unknown)`.
+- In `sessions`, `user`, `device`, `transport`, `start`, `end` and `end_reason` are omitted when unknown. Byte totals come from the `session_end` record when it carries them.
+- In `denials`, `user`, `device` and `reason` are omitted when unknown.
+- `events` is present only with `include_events`.
+
+The CSV format has one row per record (not the summary), with this fixed header:
+
+```csv
+seq,ts,event,role,user,token_id,device,session,transport,op,path,command,sha256,bytes_up,bytes_down,duration_ms,result,reason,prev_event_hash,event_hash
 ```
 
-Cells that a spreadsheet would treat as formulas are neutralised. HTML is a self-contained page with summary tiles and the same tables.
+Cells that a spreadsheet would treat as formulas are neutralised with a leading `'`. HTML is a self-contained page with summary tiles (records, sessions, operations, denials, revocations, bytes) and the same tables as the JSON.
 
 ### 3.3 Chain status
 
