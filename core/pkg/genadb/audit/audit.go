@@ -129,7 +129,9 @@ type FileSink struct {
 
 // Tee forwards every record, after it is sealed and written, to the given
 // sinks (webhooks, SIEM forwarders), so they see the same seq and hashes as
-// the file. Call it before the first Write.
+// the file. Call it before the first Write. Tees run while the record is
+// being written, which may be on an ADB data path: they must not block
+// (the built-in webhook sink and the SDK's event tap only enqueue).
 func (s *FileSink) Tee(sinks ...Sink) { s.tees = append(s.tees, sinks...) }
 
 // OpenFile opens (or creates) a chained audit log. With syncEach, every

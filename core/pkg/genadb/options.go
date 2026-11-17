@@ -118,11 +118,14 @@ func WithTransport(t TransportProvider) Option { return func(c *config) { c.tran
 func WithDeviceDiscoverer(d DeviceDiscoverer) Option { return func(c *config) { c.discoverer = d } }
 
 // WithEventHandler registers a callback for every event, in addition to the
-// Events channel. It is called synchronously and must not block.
+// Events channel. It runs on the client's event goroutine, never on a tunnel:
+// a slow handler delays later events and, past a 4096-event backlog, causes
+// drops (see DroppedEvents), but never stalls ADB traffic.
 func WithEventHandler(f func(Event)) Option { return func(c *config) { c.onEvent = f } }
 
 // WithEventBuffer sets the Events channel capacity (default 256). When the
-// channel is full, new events are dropped rather than stalling tunnels.
+// channel is full, new events are dropped (counted by DroppedEvents) rather
+// than stalling tunnels.
 func WithEventBuffer(n int) Option { return func(c *config) { c.eventBuf = n } }
 
 // WithLogger receives human-readable diagnostic lines (default: stderr).

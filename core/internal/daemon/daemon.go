@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sumukhak/new-genadb/core/pkg/genadb"
@@ -114,49 +115,111 @@ type Server struct {
 	subs map[*conn]struct{}
 }
 
+// SubscriberQueue is how many events may wait for one subscriber. A
+// subscriber that falls further behind loses events (it is told how many
+// with an "events.dropped" notification) and never slows anyone else.
+const SubscriberQueue = 256
+
+// WriteTimeout bounds one write to a client. A client that stops reading
+// for this long is disconnected.
+const WriteTimeout = 10 * time.Second
+
 // Publish forwards an SDK event to subscribed connections. Wire it with
-// genadb.WithEventHandler(srv.Publish) before creating the client.
+// genadb.WithEventHandler(srv.Publish). It never blocks: each subscriber has
+// its own bounded queue drained by its own goroutine.
 func (s *Server) Publish(e genadb.Event) {
 	s.mu.Lock()
-	cs := make([]*conn, 0, len(s.subs))
+	defer s.mu.Unlock()
 	for c := range s.subs {
-		cs = append(cs, c)
-	}
-	s.mu.Unlock()
-	for _, c := range cs {
-		c.notify("event", e)
+		select {
+		case c.queue <- e:
+		default:
+			c.dropped.Add(1)
+		}
 	}
 }
 
 type conn struct {
-	srv    *Server
-	w      io.Writer
-	wmu    sync.Mutex
-	authed bool
+	srv     *Server
+	w       io.Writer
+	wmu     sync.Mutex
+	authed  bool
+	broken  atomic.Bool
+	closer  io.Closer // set for network connections
+	queue   chan genadb.Event
+	dropped atomic.Uint64
+	stop    chan struct{}
 }
 
 func (c *conn) send(v any) {
 	b, err := json.Marshal(v)
-	if err != nil {
+	if err != nil || c.broken.Load() {
 		return
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	c.w.Write(append(b, '\n'))
+	if d, ok := c.w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		d.SetWriteDeadline(time.Now().Add(WriteTimeout))
+	}
+	if _, err := c.w.Write(append(b, '\n')); err != nil {
+		// A client that stopped reading: drop it rather than hold anything up.
+		c.broken.Store(true)
+		if c.closer != nil {
+			c.closer.Close()
+		}
+	}
 }
 
 func (c *conn) notify(method string, params any) {
 	c.send(notification{JSONRPC: "2.0", Method: method, Params: params})
 }
 
+// pump delivers queued events to one subscriber.
+func (c *conn) pump() {
+	for {
+		select {
+		case e := <-c.queue:
+			if n := c.dropped.Swap(0); n > 0 {
+				c.notify("events.dropped", map[string]any{"count": n})
+			}
+			c.notify("event", e)
+		case <-c.stop:
+			return
+		}
+	}
+}
+
+func (s *Server) subscribe(c *conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.subs == nil {
+		s.subs = map[*conn]struct{}{}
+	}
+	if _, ok := s.subs[c]; ok {
+		return
+	}
+	c.queue = make(chan genadb.Event, SubscriberQueue)
+	c.stop = make(chan struct{})
+	s.subs[c] = struct{}{}
+	go c.pump()
+}
+
+func (s *Server) unsubscribe(c *conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.subs[c]; ok {
+		delete(s.subs, c)
+		close(c.stop)
+	}
+}
+
 // ServeConn handles one stream until EOF or ctx ends.
 func (s *Server) ServeConn(ctx context.Context, rw io.ReadWriter) error {
 	c := &conn{srv: s, w: rw, authed: s.Token == ""}
-	defer func() {
-		s.mu.Lock()
-		delete(s.subs, c)
-		s.mu.Unlock()
-	}()
+	if cl, ok := rw.(io.Closer); ok {
+		c.closer = cl
+	}
+	defer s.unsubscribe(c)
 	sc := bufio.NewScanner(rw)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
@@ -328,18 +391,11 @@ func (s *Server) call(ctx context.Context, c *conn, req request) (any, error) {
 		return nil, nil
 
 	case "events.subscribe":
-		s.mu.Lock()
-		if s.subs == nil {
-			s.subs = map[*conn]struct{}{}
-		}
-		s.subs[c] = struct{}{}
-		s.mu.Unlock()
+		s.subscribe(c)
 		return map[string]any{"subscribed": true}, nil
 
 	case "events.unsubscribe":
-		s.mu.Lock()
-		delete(s.subs, c)
-		s.mu.Unlock()
+		s.unsubscribe(c)
 		return map[string]any{"subscribed": false}, nil
 
 	case "audit.report":

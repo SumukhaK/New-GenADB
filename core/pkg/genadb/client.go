@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sumukhak/new-genadb/core/internal/engine"
@@ -26,6 +27,14 @@ type Client struct {
 	events    chan Event
 	sink      audit.Sink // nil when audit is off
 	auditPath string
+
+	// Events are delivered by one dispatcher goroutine so that a slow
+	// handler or channel reader never blocks the agents (audit records are
+	// produced on the ADB data path).
+	dispatch chan Event
+	quit     chan struct{}
+	dispDone chan struct{}
+	dropped  atomic.Uint64
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -77,7 +86,9 @@ func New(opts ...Option) (*Client, error) {
 	if cfg.logger != nil {
 		engine.SetLogger(cfg.logger)
 	}
-	c := &Client{cfg: cfg, events: make(chan Event, max(cfg.eventBuf, 1)), sessions: map[string]*Session{}}
+	c := &Client{cfg: cfg, events: make(chan Event, max(cfg.eventBuf, 1)), sessions: map[string]*Session{},
+		dispatch: make(chan Event, dispatchBuffer), quit: make(chan struct{}), dispDone: make(chan struct{})}
+	go c.dispatcher()
 	if c.auditEnabled() {
 		if err := c.openAudit(); err != nil {
 			return nil, err
@@ -141,18 +152,56 @@ func (c *Client) AuditPath() string { return c.auditPath }
 // reader falls behind; use WithEventHandler for lossless delivery.
 func (c *Client) Events() <-chan Event { return c.events }
 
+// dispatchBuffer is how many events may wait for a slow handler before
+// new ones are dropped (counted by DroppedEvents).
+const dispatchBuffer = 4096
+
+// emit never blocks.
 func (c *Client) emit(e Event) {
 	if e.Time.IsZero() {
 		e.Time = time.Now()
 	}
+	select {
+	case c.dispatch <- e:
+	default:
+		c.dropped.Add(1)
+	}
+}
+
+func (c *Client) deliver(e Event) {
 	if c.cfg.onEvent != nil {
 		c.cfg.onEvent(e)
 	}
 	select {
 	case c.events <- e:
 	default:
+		c.dropped.Add(1)
 	}
 }
+
+func (c *Client) dispatcher() {
+	defer close(c.dispDone)
+	for {
+		select {
+		case e := <-c.dispatch:
+			c.deliver(e)
+		case <-c.quit:
+			for {
+				select {
+				case e := <-c.dispatch:
+					c.deliver(e)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// DroppedEvents counts events discarded because the event handler or the
+// Events channel reader fell behind. Audit records are never dropped from
+// the audit log itself, only from the event stream.
+func (c *Client) DroppedEvents() uint64 { return c.dropped.Load() }
 
 // PublicKey returns this machine's identity public key (creating the key on
 // first use). Corporate token issuers bind user tokens to it.
@@ -281,6 +330,12 @@ func (c *Client) Close() error {
 	}
 	if c.sink != nil {
 		c.closeErr = c.sink.Close()
+	}
+	close(c.quit)
+	// Deliver what is queued, but never let a stuck handler hang Close.
+	select {
+	case <-c.dispDone:
+	case <-time.After(2 * time.Second):
 	}
 	return c.closeErr
 }

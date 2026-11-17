@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sumukhak/new-genadb/core/internal/daemon"
 	"github.com/sumukhak/new-genadb/core/internal/engine"
 	"github.com/sumukhak/new-genadb/core/pkg/genadb"
 	"github.com/sumukhak/new-genadb/core/pkg/genadb/audit"
@@ -382,4 +384,72 @@ func TestDoctor(t *testing.T) {
 	if r.OK {
 		t.Fatalf("unreachable relay reported OK: %+v", r.Checks)
 	}
+}
+
+// Regression: a UI that subscribes to events and stops reading, or an event
+// handler that blocks, must not stall ADB tunnels (audit records are written
+// on the data path and republished as events).
+func TestBlockedEventConsumersDoNotStallTunnels(t *testing.T) {
+	w := startWorld(t)
+	srv := &daemon.Server{}
+	block := make(chan struct{})
+	defer close(block)
+	c, err := genadb.New(
+		genadb.WithRelayURL(w.relay),
+		genadb.WithStateDir(t.TempDir()),
+		genadb.WithAuditConfig(genadb.AuditConfig{Mode: genadb.AuditOn}),
+		genadb.WithEventHandler(func(e genadb.Event) {
+			srv.Publish(e)
+			<-block // a handler that never returns
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	srv.Client = c
+
+	// A daemon client that subscribes and then never reads again.
+	ui, server := net.Pipe()
+	defer ui.Close()
+	go srv.ServeConn(w.ctx, server)
+	ui.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"events.subscribe"}` + "\n"))
+	buf := make([]byte, 256)
+	ui.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := ui.Read(buf); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	sess, err := c.Connect(w.ctx, genadb.ConnectRequest{PairingCode: w.code})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("x"), 1<<20)
+	start := time.Now()
+	const pushes = 8
+	for i := 0; i < pushes; i++ {
+		done := make(chan struct{})
+		go func() { defer close(done); adbPush(t, sess.ADBAddr(), fmt.Sprintf("/sdcard/f%d", i), content) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("push %d stalled behind blocked event consumers", i)
+		}
+	}
+	elapsed := time.Since(start)
+	waitFor(t, "audit records", func() bool {
+		evs, _ := audit.ReadFile(c.AuditPath())
+		n := 0
+		for _, e := range evs {
+			if e["op"] == "push" {
+				n++
+			}
+		}
+		return n == pushes
+	})
+	if c.DroppedEvents() == 0 {
+		// Not an error by itself, but proves the consumers really were stuck.
+		t.Log("no events dropped")
+	}
+	t.Logf("%d x 1 MiB pushes in %v with a blocked handler and a stalled subscriber (%d events dropped)", pushes, elapsed, c.DroppedEvents())
 }
