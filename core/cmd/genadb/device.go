@@ -72,7 +72,11 @@ func cmdDevice(args []string) error {
 	if *debugPolicy != "allowed" {
 		// MDM has disabled debugging features: never offer a tunnel to adbd.
 		emit("blocked", map[string]any{"reason": "debugging_disallowed"})
-		select {} // stay visible to the UI but do nothing
+		// Stay visible to the UI but do nothing. A bare select{} with no
+		// other goroutine alive is a fatal runtime deadlock, so sleep.
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
 	key, err := loadOrCreateKey(*state)
 	if err != nil {
@@ -107,10 +111,26 @@ func cmdDevice(args []string) error {
 		}
 	}
 	announced := false
+	// Reconnect quickly after a session that was up for a while (a relay
+	// restart), back off to 5 s once the network has been down for ~10 s, and log only
+	// the first failure of a streak to keep the log and the radio quiet.
+	backoff, failures := time.Second, 0
 	for {
+		started := time.Now()
 		err := d.session(&announced)
-		logf("relay session ended: %v; reconnecting", err)
-		time.Sleep(time.Second)
+		if time.Since(started) > 30*time.Second {
+			backoff, failures = time.Second, 0
+		}
+		failures++
+		if failures == 1 {
+			logf("relay session ended: %v; reconnecting", err)
+		} else if failures%30 == 0 {
+			logf("relay still unreachable after %d attempts: %v", failures, err)
+		}
+		time.Sleep(backoff)
+		if failures > 10 && backoff < 5*time.Second {
+			backoff += time.Second
+		}
 	}
 }
 

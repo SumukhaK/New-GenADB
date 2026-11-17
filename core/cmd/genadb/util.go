@@ -91,7 +91,11 @@ func closeWrite(c net.Conn) {
 func dial(addr string) (net.Conn, error) { return dialTimeout(addr, 5*time.Second) }
 
 func dialTimeout(addr string, d time.Duration) (net.Conn, error) {
-	c, err := net.DialTimeout("tcp", addr, d)
+	// Aggressive TCP keepalive: a silently dead path (radio loss without a
+	// reset) is noticed in ~25 s instead of the OS default of minutes.
+	dl := net.Dialer{Timeout: d, KeepAliveConfig: net.KeepAliveConfig{Enable: true,
+		Idle: 10 * time.Second, Interval: 5 * time.Second, Count: 3}}
+	c, err := dl.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}

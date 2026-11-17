@@ -144,11 +144,15 @@ func (x *adbAccel) checkCNXN(m *adbMsg, fromLocal bool) {
 		} else {
 			x.dackRemote = true
 		}
-		if x.dackLocal && x.dackRemote {
+		if x.dackLocal && x.dackRemote && !x.off {
 			x.off = true
+			logf("adb flow-control acceleration off: both ends negotiated delayed_ack")
 		}
 	}
 	if m.cmd == aSTLS {
+		if !x.off {
+			logf("adb flow-control acceleration off: adbd upgraded to TLS (STLS); adb's own one-packet-per-round-trip pacing applies")
+		}
 		x.off = true
 	}
 }

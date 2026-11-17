@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -59,7 +61,7 @@ func dialRelay(spec string) (net.Conn, error) {
 		return nil, fmt.Errorf("unsupported relay scheme %q", u.Scheme)
 	}
 	tr := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: false,
-		TLSHandshakeTimeout: 10 * time.Second, DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext}
+		TLSHandshakeTimeout: 10 * time.Second, DialContext: relayDialContext}
 	if relayTransport.proxy != "" {
 		pu, err := url.Parse(relayTransport.proxy)
 		if err != nil {
@@ -82,7 +84,71 @@ func dialRelay(spec string) (net.Conn, error) {
 		return nil, fmt.Errorf("relay websocket: %w", err)
 	}
 	c.SetReadLimit(-1)
+	go wsKeepalive(c)
 	return websocket.NetConn(context.Background(), c, websocket.MessageBinary), nil
+}
+
+// wsKeepalive pings an otherwise idle WebSocket. Reverse proxies and tunnels
+// (and carrier NATs) drop connections that carry nothing for a minute or two,
+// which would bounce the device's control channel every couple of minutes.
+// Pongs are only seen while someone reads the connection; relay clients
+// always keep a reader running, so a missing pong means the path is dead.
+func wsKeepalive(c *websocket.Conn) {
+	tk := time.NewTicker(25 * time.Second)
+	defer tk.Stop()
+	for range tk.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := c.Ping(ctx)
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				// No pong within 10 s while the reader is running: the
+				// path is dead (e.g. a phone that lost its radio without a
+				// reset). Close so both sides reconnect instead of hanging.
+				c.Close(websocket.StatusGoingAway, "keepalive timeout")
+			}
+			return
+		}
+	}
+}
+
+// relayDialContext dials the relay (or proxy) host, remembering the addresses
+// of the last successful lookup. Agents reconnect exactly when the network is
+// misbehaving, which is also when DNS is slowest; falling back to the last
+// known addresses keeps a flaky resolver from stretching every reconnect.
+var relayAddrs, dnsFallbackWarned sync.Map // host -> []string, host -> bool
+
+func relayDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || net.ParseIP(host) != nil {
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+	}
+	lctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	ips, lerr := net.DefaultResolver.LookupHost(lctx, host)
+	cancel()
+	if lerr == nil && len(ips) > 0 {
+		relayAddrs.Store(host, ips)
+		dnsFallbackWarned.Delete(host)
+	} else if v, ok := relayAddrs.Load(host); ok {
+		if _, warned := dnsFallbackWarned.LoadOrStore(host, true); !warned {
+			logf("DNS lookup for %s failed (%v); using last known addresses", host, lerr)
+		}
+		ips = v.([]string)
+	} else {
+		return nil, lerr
+	}
+	// IPv4 first, then IPv6, each with a short timeout: cellular networks
+	// often advertise an IPv6 path that black-holes.
+	sort.SliceStable(ips, func(i, j int) bool { return !strings.Contains(ips[i], ":") && strings.Contains(ips[j], ":") })
+	var last error
+	for _, ip := range ips {
+		c, err := (&net.Dialer{Timeout: 4 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ip, port))
+		if err == nil {
+			return c, nil
+		}
+		last = err
+	}
+	return nil, last
 }
 
 func relayTLSConfig() (*tls.Config, error) {
@@ -126,7 +192,15 @@ func (r *relay) serveWebSocket(addr, certFile, keyFile string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		if !r.allow(clientIP(req.RemoteAddr), "ws-accept") {
+		remote := req.RemoteAddr
+		if r.trustForwarded {
+			// Behind a reverse proxy / tunnel every client shares the proxy's
+			// address; rate-limit and audit by the address it reports instead.
+			if ip := forwardedIP(req); ip != "" {
+				remote = net.JoinHostPort(ip, "0")
+			}
+		}
+		if !r.allow(clientIP(remote), "ws-accept") {
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return
 		}
@@ -135,8 +209,9 @@ func (r *relay) serveWebSocket(addr, certFile, keyFile string) error {
 			return
 		}
 		c.SetReadLimit(-1)
+		go wsKeepalive(c)
 		nc := websocket.NetConn(context.Background(), c, websocket.MessageBinary)
-		r.handle(&wsConn{Conn: nc, remote: req.RemoteAddr})
+		r.handle(&wsConn{Conn: nc, remote: remote})
 	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
@@ -161,6 +236,22 @@ type wsAddr string
 
 func (a wsAddr) Network() string { return "ws" }
 func (a wsAddr) String() string  { return string(a) }
+
+// forwardedIP returns the client address reported by a trusted reverse proxy.
+func forwardedIP(req *http.Request) string {
+	for _, h := range []string{"CF-Connecting-IP", "X-Real-IP"} {
+		if ip := net.ParseIP(strings.TrimSpace(req.Header.Get(h))); ip != nil {
+			return ip.String()
+		}
+	}
+	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
+		first, _, _ := strings.Cut(xff, ",")
+		if ip := net.ParseIP(strings.TrimSpace(first)); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
+}
 
 func clientIP(addr string) string {
 	h, _, err := net.SplitHostPort(addr)
