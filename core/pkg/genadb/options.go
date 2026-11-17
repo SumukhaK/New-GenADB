@@ -39,6 +39,10 @@ type AuditConfig struct {
 	WebhookSecret []byte
 	// Sinks are extra destinations (SIEM forwarders, tests, ...).
 	Sinks []AuditSink
+	// AnchorKeyFile holds the key that signs the log's anchor, which makes
+	// deleting the oldest or newest records detectable. Default:
+	// audit-anchor.key next to the log, created on first use.
+	AnchorKeyFile string
 }
 
 // ReconnectPolicy controls how Connect retries a session that fails to

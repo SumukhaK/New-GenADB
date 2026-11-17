@@ -232,17 +232,26 @@ func checkAudit(path string) Check {
 	if path == "" {
 		return Check{Name: "audit_log", Status: CheckSkip, Detail: "audit logging off"}
 	}
-	evs, err := audit.ReadFile(path)
-	if os.IsNotExist(err) {
+	_, serr := os.Stat(path)
+	_, aerr := os.Stat(audit.AnchorPath(path))
+	if os.IsNotExist(serr) && os.IsNotExist(aerr) {
 		return Check{Name: "audit_log", Status: CheckOK, Detail: path + " (no records yet)"}
 	}
+	st, err := audit.VerifyFile(path, audit.VerifyOptions{})
 	if err != nil {
 		return Check{Name: "audit_log", Status: CheckFail, Detail: err.Error()}
 	}
-	st := audit.Verify(evs)
 	if !st.Valid {
-		return Check{Name: "audit_log", Status: CheckFail, Detail: fmt.Sprintf("%s: chain broken at record %d: %s", path, st.BrokenAt, st.Problem),
-			Hint: "the log was edited, truncated or reordered; preserve it for investigation"}
+		where := ""
+		if st.BrokenAt > 0 {
+			where = fmt.Sprintf(" at record %d", st.BrokenAt)
+		}
+		return Check{Name: "audit_log", Status: CheckFail, Detail: fmt.Sprintf("%s: verification failed%s: %s", path, where, st.Problem),
+			Hint: "the log or its anchor was edited, truncated or reordered; preserve both files for investigation"}
 	}
-	return Check{Name: "audit_log", Status: CheckOK, Detail: fmt.Sprintf("%s: %d records, chain intact", path, len(evs))}
+	detail := fmt.Sprintf("%s: %d records, chain intact, anchor %s", path, st.Records, st.Anchor)
+	if len(st.Warnings) > 0 {
+		return Check{Name: "audit_log", Status: CheckWarn, Detail: detail + "; " + strings.Join(st.Warnings, "; ")}
+	}
+	return Check{Name: "audit_log", Status: CheckOK, Detail: detail}
 }

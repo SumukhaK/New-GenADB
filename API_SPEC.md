@@ -300,7 +300,9 @@ Never recorded: tokens, pairing codes, passwords, command arguments, environment
   "until": "2026-11-17T00:00:00Z",
   "first_event": "2026-11-10T08:00:00Z",
   "last_event": "2026-11-16T18:30:00Z",
-  "chain": { "valid": true, "records": 812, "broken_at": 0, "problem": "", "last_hash": "9f2c…", "unchained": 0 },
+  "chain": { "valid": true, "records": 812, "broken_at": 0, "problem": "", "last_hash": "9f2c…", "unchained": 0,
+             "first_seq": 1, "starts_at_genesis": true, "anchor": "verified",
+             "warnings": ["1 record(s) after the anchor (a writer stopped between the record and the anchor update)"] },
   "totals": { "records": 812, "sessions": 40, "operations": 655, "denials": 3, "revocations": 1,
               "bytes_up": 734003200, "bytes_down": 52428800, "users": 4, "devices": 6 },
   "by_user":   [ { "key": "alice", "sessions": 10, "operations": 200, "denials": 0, "bytes_up": 1048576, "bytes_down": 2048 } ],
@@ -334,7 +336,22 @@ Cells that a spreadsheet would treat as formulas are neutralised with a leading 
 
 ### 3.3 Chain status
 
-`{valid, records, broken_at?, problem?, last_hash?, unchained?}`. `broken_at` is the 1-based index of the first record that fails verification.
+`{valid, records, broken_at?, problem?, last_hash?, unchained?, first_seq?, starts_at_genesis, anchor?, warnings?}`. `broken_at` is the 1-based index of the first record that fails verification. `first_seq` is the seq of the oldest chained record, and `starts_at_genesis` says whether it links to the all-zero genesis hash.
+
+`anchor` is reported when the log is verified from disk (`audit verify`, the daemon's `audit.verify`, `doctor`): `verified`, `unverified` (the anchor key is not available, so positions are checked but not the signature), `invalid` or `none`.
+
+### 3.3.1 Anchor file
+
+The hash chain shows that the records present are intact and in order, but not that none are missing at either end: removing the oldest or newest lines leaves a shorter chain that still verifies. Every log therefore has an anchor next to it (`audit.jsonl` → `audit.anchor`), rewritten after each record:
+
+```json
+{ "version": 1, "first_seq": 1, "first_prev_event_hash": "0000…", "first_event_hash": "ab12…",
+  "last_seq": 812, "last_event_hash": "9f2c…", "updated": "2026-11-17T10:00:00Z", "mac": "<hex>" }
+```
+
+`mac` is HMAC-SHA256 over `"setu-audit-anchor-v1\n"` followed by the anchor's JSON without `mac`. The key is 32 random bytes, hex-encoded, in `audit-anchor.key` in the log's directory (mode 0600, created on first use), or a file of your choice. Verification fails when the log's first record is not the anchored one (the oldest records were deleted), when it ends before the anchored last record (the newest records were deleted), when the log is empty or missing but its anchor is not, or when the MAC does not match. Writers refuse to append to such a log. A log written by an older version is anchored from its current contents the first time it is opened.
+
+The anchor defeats anyone who cannot forge its MAC. Someone who holds the key and can write both files can still rewrite history, so keep the key on another volume, and use the webhook (3.4) or a SIEM copy as the record of last resort. `audit rotate` moves a log and its anchor aside and starts a new log whose chain continues from the old one.
 
 ### 3.4 Webhook delivery
 

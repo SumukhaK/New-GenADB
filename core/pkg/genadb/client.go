@@ -112,7 +112,8 @@ func (c *Client) openAudit() error {
 	if c.auditPath == "" {
 		c.auditPath = filepath.Join(c.cfg.state, "audit.jsonl")
 	}
-	f, err := audit.OpenFile(c.auditPath, c.cfg.mode == ModeCorporate)
+	f, err := audit.OpenFileWith(c.auditPath, audit.FileOptions{Sync: c.cfg.mode == ModeCorporate,
+		AnchorKeyFile: c.cfg.audit.AnchorKeyFile})
 	if err != nil {
 		return fmt.Errorf("genadb: audit log: %w", err)
 	}
@@ -147,6 +148,10 @@ func (c *Client) StateDir() string { return c.cfg.state }
 
 // AuditPath is the audit log file, or "" when auditing is off.
 func (c *Client) AuditPath() string { return c.auditPath }
+
+// AuditAnchorKeyFile returns the configured anchor key file ("" = the default
+// next to the log).
+func (c *Client) AuditAnchorKeyFile() string { return c.cfg.audit.AnchorKeyFile }
 
 // Events returns the event channel. Events are dropped, not queued, when the
 // reader falls behind; use WithEventHandler for lossless delivery.

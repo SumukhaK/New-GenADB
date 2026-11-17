@@ -222,7 +222,9 @@ func TestChainStatusMatchesAPISpec(t *testing.T) {
 	typePaths("", reflect.TypeOf(ChainStatus{}), code)
 	var names []string
 	for p := range code {
-		names = append(names, strings.TrimPrefix(p, "."))
+		if !strings.HasSuffix(p, "[]") { // element of a list field, e.g. warnings[]
+			names = append(names, strings.TrimPrefix(p, "."))
+		}
 	}
 	sort.Strings(spec)
 	sort.Strings(names)

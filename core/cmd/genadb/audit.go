@@ -14,7 +14,8 @@ import (
 
 const auditUsage = `usage:
   genadb audit report [--log PATH | --state DIR] [--format json|csv|html] [--since T] [--until T] [--events] [--out FILE]
-  genadb audit verify [--log PATH | --state DIR]
+  genadb audit verify [--log PATH | --state DIR] [--anchor-key-file FILE]
+  genadb audit rotate [--log PATH | --state DIR] --to ARCHIVE [--anchor-key-file FILE]
 
 T is RFC 3339 (2026-01-02T15:04:05Z), a date (2026-01-02) or a duration ago (24h).`
 
@@ -33,6 +34,8 @@ func cmdAudit(args []string) int {
 		if err == nil && !ok {
 			return 1
 		}
+	case "rotate":
+		err = auditRotate(args[1:])
 	case "-h", "--help", "help":
 		fmt.Println(auditUsage)
 		return 0
@@ -79,6 +82,7 @@ func auditReport(args []string) error {
 	since := fs.String("since", "", "only records at or after this time")
 	until := fs.String("until", "", "only records before this time")
 	events := fs.Bool("events", false, "embed the raw records in a JSON report")
+	keyFile := anchorKeyFlag(fs)
 	out := fs.String("out", "", "write to FILE instead of stdout")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -100,6 +104,11 @@ func auditReport(args []string) error {
 	if err != nil {
 		return err
 	}
+	st, err := audit.VerifyFile(path(), audit.VerifyOptions{AnchorKeyFile: *keyFile})
+	if err != nil {
+		return err
+	}
+	opt.Chain = &st
 	var w io.Writer = os.Stdout
 	if *out != "" {
 		file, err := os.OpenFile(*out, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
@@ -115,15 +124,43 @@ func auditReport(args []string) error {
 func auditVerify(args []string) (bool, error) {
 	fs := flag.NewFlagSet("audit verify", flag.ContinueOnError)
 	path := logFlags(fs)
+	keyFile := anchorKeyFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return false, err
 	}
-	evs, err := audit.ReadFile(path())
+	st, err := audit.VerifyFile(path(), audit.VerifyOptions{AnchorKeyFile: *keyFile})
 	if err != nil {
 		return false, err
 	}
-	st := audit.Verify(evs)
 	b, _ := json.MarshalIndent(st, "", "  ")
 	fmt.Println(string(b))
+	for _, w := range st.Warnings {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
 	return st.Valid, nil
+}
+
+func anchorKeyFlag(fs *flag.FlagSet) *string {
+	return fs.String("anchor-key-file", "", "key that signs the log's anchor (default: "+audit.AnchorKeyFileName+" next to the log)")
+}
+
+// auditRotate archives the log and its anchor and starts a new log that
+// continues the chain. Running writers switch to the new file on their next
+// record.
+func auditRotate(args []string) error {
+	fs := flag.NewFlagSet("audit rotate", flag.ContinueOnError)
+	path := logFlags(fs)
+	keyFile := anchorKeyFlag(fs)
+	to := fs.String("to", "", "archive path for the current log (its anchor moves alongside)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *to == "" {
+		return fmt.Errorf("--to is required")
+	}
+	if err := audit.RotateFile(path(), *to, audit.FileOptions{Sync: true, AnchorKeyFile: *keyFile}); err != nil {
+		return err
+	}
+	fmt.Printf("rotated %s -> %s\n", path(), *to)
+	return nil
 }
