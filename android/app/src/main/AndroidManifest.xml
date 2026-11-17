@@ -12,7 +12,6 @@
 
     <application
         android:label="GenADB Companion"
-        android:extractNativeLibs="true"
         android:allowBackup="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
