@@ -28,7 +28,7 @@ public class ProcessAgentLauncher(
 ) : AgentLauncher {
     override fun launch(args: List<String>, env: Map<String, String>): AgentProcess {
         val pb = ProcessBuilder(listOf(executable.absolutePath) + args)
-        if (logFile != null) pb.redirectError(logFile) else pb.redirectError(ProcessBuilder.Redirect.DISCARD)
+        if (logFile != null) pb.redirectError(logFile) else pb.redirectError(File("/dev/null")) // Redirect.DISCARD is not in android.jar
         pb.environment().putAll(env)
         val p = pb.start()
         val reader = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8))
