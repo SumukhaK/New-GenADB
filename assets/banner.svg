@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-labelledby="bt">
-  <title id="bt">New-GenADB: end-to-end encrypted remote Android debugging</title>
+  <title id="bt">Setu (Setu-SDK): an encrypted bridge between your IDE and any Android device, anywhere</title>
   <defs>
     <linearGradient id="blink" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0" stop-color="#10B981"/>
@@ -20,8 +20,11 @@
   <g transform="translate(96 64) scale(1.5)">
   <rect width="128" height="128" rx="28" fill="#0F172A"/>
   <rect x="2" y="2" width="124" height="124" rx="26" fill="none" stroke="#1E293B" stroke-width="2"/>
-  <!-- tunnel arch -->
-  <path d="M26 42 C 42 16, 86 16, 102 42" fill="none" stroke="url(#blink)" stroke-width="3.5" stroke-linecap="round" stroke-dasharray="0.5 7"/>
+  <!-- setu: a suspension bridge between device and terminal -->
+  <path d="M26 42 C 42 16, 86 16, 102 42" fill="none" stroke="url(#blink)" stroke-width="3.5" stroke-linecap="round"/>
+  <line x1="48" y1="25.1" x2="48" y2="72" stroke="url(#blinkh)" stroke-width="2" stroke-linecap="round" opacity="0.8"/>
+  <line x1="64" y1="22.5" x2="64" y2="57" stroke="url(#blinkh)" stroke-width="2" stroke-linecap="round" opacity="0.8"/>
+  <line x1="80" y1="25.1" x2="80" y2="72" stroke="url(#blinkh)" stroke-width="2" stroke-linecap="round" opacity="0.8"/>
   <!-- Android device -->
   <rect x="12" y="40" width="28" height="54" rx="7" fill="#0F172A" stroke="#10B981" stroke-width="4"/>
   <line x1="22" y1="47" x2="30" y2="47" stroke="#10B981" stroke-width="3" stroke-linecap="round"/>
@@ -38,8 +41,8 @@
   <circle cx="64" cy="72" r="2" fill="#0F172A"/>
 </g>
   <g font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
-    <text x="344" y="150" font-size="72" font-weight="700" fill="#F8FAFC" letter-spacing="-1">New-<tspan fill="#10B981">Gen</tspan>ADB</text>
-    <text x="348" y="198" font-size="26" fill="#CBD5E1">End-to-end encrypted remote Android debugging (ADB)</text>
-    <text x="348" y="234" font-size="26" fill="#94A3B8">across carrier NAT and corporate firewalls</text>
+    <text x="344" y="146" font-size="76" font-weight="700" fill="#F8FAFC" letter-spacing="-1">Setu<tspan font-size="40" font-weight="600" fill="#10B981" dx="4">-SDK</tspan></text>
+    <text x="348" y="196" font-size="24" fill="#CBD5E1">An encrypted bridge between your IDE and any Android device, anywhere.</text>
+    <text x="348" y="234" font-size="22" fill="#94A3B8">End-to-end encrypted ADB across carrier NAT and corporate firewalls</text>
   </g>
 </svg>

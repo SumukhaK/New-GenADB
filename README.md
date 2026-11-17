@@ -1,8 +1,10 @@
 <p align="center">
-  <img src="assets/logo.svg" width="112" height="112" alt="New-GenADB logo: an encrypted tunnel between an Android phone and a developer terminal">
+  <img src="assets/logo.svg" width="112" height="112" alt="Setu logo: an encrypted bridge between an Android phone and a developer terminal">
 </p>
 
-<h1 align="center">New-GenADB</h1>
+<h1 align="center">Setu</h1>
+
+<p align="center"><b>Setu-SDK</b>: an encrypted bridge between your IDE and any Android device, anywhere.</p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-3B82F6?style=flat-square"></a>
@@ -11,10 +13,10 @@
   <a href="results.tsv"><img alt="Eval score: 98.97/100" src="https://img.shields.io/badge/eval_score-98.97%2F100-0F172A?style=flat-square"></a>
 </p>
 
-**Use a real Android phone from anywhere as if it were plugged into your computer.** New-GenADB connects Android Studio, any IDE, or plain `adb` to a physical device on another network: across the office, across the country, or behind a carrier NAT. You can deploy APKs and AABs, stream logcat, debug, push and pull files, and take screenshots.
+**Use a real Android phone from anywhere as if it were plugged into your computer.** Setu (Sanskrit for "bridge") connects Android Studio, any IDE, or plain `adb` to a physical device on another network: across the office, across the country, or behind a carrier NAT. You can deploy APKs and AABs, stream logcat, debug, push and pull files, and take screenshots.
 
 ```
-$ genadb connect --relay wss://relay.example.com/ --code 4821-K7QZPM
+$ setu connect --relay wss://relay.example.com/ --code 4821-K7QZPM
 {"event":"listening","addr":"127.0.0.1:41377","device_id":"pixel-7-…"}
 $ adb connect 127.0.0.1:41377
 $ adb install app-debug.apk      # Android Studio sees the device too
@@ -32,7 +34,7 @@ The usual workarounds each fall short. `adb tcpip` exposed through a port forwar
 
 ## Why it matters
 
-New-GenADB makes a remote device look local to `adb`, and therefore to every tool built on it. It does this without asking you to trust the network in between:
+Setu makes a remote device look local to `adb`, and therefore to every tool built on it. It does this without asking you to trust the network in between:
 
 - **End-to-end encrypted and mutually authenticated.** The relay that connects the two sides only forwards opaque bytes. It never sees ADB traffic, files, or the pairing code.
 - **Zero-config for individuals.** Install the companion app, read a one-time code off the phone, and connect. Pairing is remembered.
@@ -45,13 +47,13 @@ New-GenADB makes a remote device look local to `adb`, and therefore to every too
 ```mermaid
 flowchart LR
     subgraph Dev["Developer computer"]
-        IDE["Android Studio / IDE / adb"] -->|"adb connect 127.0.0.1:PORT"| CA["genadb connect<br/>(Go SDK / daemon)"]
+        IDE["Android Studio / IDE / adb"] -->|"adb connect 127.0.0.1:PORT"| CA["setu connect<br/>(Go SDK / daemon)"]
     end
     subgraph Net["Internet"]
-        R["genadb relay<br/>(rendezvous, policy, admin)"]
+        R["setu relay<br/>(rendezvous, policy, admin)"]
     end
     subgraph Phone["Android device"]
-        DA["genadb-android SDK<br/>(device agent)"] --> ADBD["system adbd<br/>(Wireless debugging)"]
+        DA["setu-android SDK<br/>(device agent)"] --> ADBD["system adbd<br/>(Wireless debugging)"]
     end
     CA <-->|"TCP / WebSocket / WSS"| R
     R <-->|"TCP / WebSocket / WSS"| DA
@@ -98,10 +100,10 @@ sequenceDiagram
 ```mermaid
 flowchart TB
     subgraph Go["core/ (Go)"]
-        CLI["cmd/genadb<br/>relay · device · connect · doctor · audit"]
-        DMN["cmd/genadb-daemon<br/>JSON-RPC 2.0"]
-        SDK["pkg/genadb<br/>Client · Session · options · interfaces"]
-        AUD["pkg/genadb/audit<br/>hash chain · reports · webhook"]
+        CLI["cmd/setu (and genadb)<br/>relay · device · connect · doctor · audit"]
+        DMN["cmd/setu-daemon<br/>JSON-RPC 2.0"]
+        SDK["pkg/genadb<br/>SetuClient · SetuSession · options · interfaces"]
+        AUD["pkg/genadb/audit<br/>hash chain · signed anchor · reports · webhook"]
         ENG["internal/engine<br/>transport · tunnel · policy (unexported)"]
         CLI --> ENG
         CLI --> SDK
@@ -111,7 +113,7 @@ flowchart TB
         ENG --> AUD
     end
     subgraph Android["android/ (Kotlin)"]
-        LIB["genadb-android (AAR)<br/>GenAdbManager"]
+        LIB["setu-android (AAR)<br/>SetuManager"]
         APP["companion app"]
         APP --> LIB
     end
@@ -131,6 +133,12 @@ flowchart TB
 
 The wire protocol, framing and session security live in `internal/engine` and are deliberately not part of any public API.
 
+**Names before v1.0.1.** The project was called New-GenADB until v1.0.1. The old names keep working:
+- **Commands:** `genadb` and `genadb-daemon` are the same programs as `setu` and `setu-daemon`.
+- **Go SDK:** `Client` and `Session` are aliases of `SetuClient` and `SetuSession`.
+- **Android SDK:** `GenAdbManager` and `GenAdbConfig` are deprecated names for `SetuManager` and `SetuConfig`.
+- **Unchanged:** the Go module path, the Kotlin package `dev.genadb.sdk`, the state directories and the wire protocol.
+
 ### Modes
 
 | | Solo | Corporate |
@@ -144,24 +152,24 @@ The wire protocol, framing and session security live in `internal/engine` and ar
 ## Quickstart: CLI
 
 ```bash
-cd core && go build -o genadb ./cmd/genadb
+cd core && go build -o setu ./cmd/setu
 
 # 1. A relay somewhere both sides can reach (a small VM, or a tunnel to your laptop)
-./genadb relay --listen 0.0.0.0:7000 --ws-listen 0.0.0.0:8443 --tls-cert cert.pem --tls-key key.pem
+./setu relay --listen 0.0.0.0:7000 --ws-listen 0.0.0.0:8443 --tls-cert cert.pem --tls-key key.pem
 
 # 2. On the phone: the companion app (android/) or the agent itself
-./genadb device --relay wss://relay.example.com:8443/ --adbd auto
+./setu device --relay wss://relay.example.com:8443/ --adbd auto
 #   -> {"event":"pairing_code","code":"4821-K7QZPM",...}
 
 # 3. On your computer
-./genadb connect --relay wss://relay.example.com:8443/ --code 4821-K7QZPM
+./setu connect --relay wss://relay.example.com:8443/ --code 4821-K7QZPM
 adb connect 127.0.0.1:<port from the "listening" event>
 
 # Later: no code needed
-./genadb connect --relay wss://relay.example.com:8443/ --device <device id>
+./setu connect --relay wss://relay.example.com:8443/ --device <device id>
 
 # Something wrong? Check adb, state, proxy settings and relay reachability
-./genadb doctor --relay wss://relay.example.com:8443/
+./setu doctor --relay wss://relay.example.com:8443/
 ```
 
 ## Quickstart: Go SDK
@@ -181,7 +189,7 @@ func main() {
     ctx := context.Background()
     c, err := genadb.New(
         genadb.WithRelayURL("wss://relay.example.com:8443/"),
-        genadb.WithStateDir("~/.genadb"),
+        genadb.WithStateDir("~/.setu"),
         genadb.WithReconnectPolicy(genadb.DefaultReconnectPolicy),
         genadb.WithEventHandler(func(e genadb.Event) { fmt.Println(e.Type, e.Fields) }),
     )
@@ -205,22 +213,22 @@ func main() {
 }
 ```
 
-Other languages can use `genadb-daemon`, which offers the same operations over JSON-RPC 2.0 on loopback. See [API_SPEC.md](API_SPEC.md).
+Other languages can use `setu-daemon`, which offers the same operations over JSON-RPC 2.0 on loopback. See [API_SPEC.md](API_SPEC.md).
 
 ## Quickstart: Android (Kotlin)
 
 ```kotlin
-// settings.gradle.kts: include(":genadb-android"), or depend on genadb-android.aar
+// settings.gradle.kts: include(":genadb-android"), or depend on setu-android-1.0.1.aar
 // app/build.gradle.kts: packaging { jniLibs { useLegacyPackaging = true } }
 
-val genadb = GenAdbManager.initialize(
-    GenAdbManager.Builder(context)
-        .config(GenAdbConfig(relayUrl = "wss://relay.example.com:8443/"))
+val setu = SetuManager.initialize(
+    SetuManager.Builder(context)
+        .config(SetuConfig(relayUrl = "wss://relay.example.com:8443/"))
 )
 
-genadb.start()                       // call from a foreground service
+setu.start()                         // call from a foreground service
 lifecycleScope.launch {
-    genadb.connectionState.collect { state ->
+    setu.connectionState.collect { state ->
         when (state) {
             is ConnectionState.Online -> showCode(state.pairingCode)
             is ConnectionState.Blocked -> showPolicyMessage(state.reason)
@@ -229,13 +237,13 @@ lifecycleScope.launch {
         }
     }
 }
-val code = genadb.pair()             // suspend; solo mode
-genadb.stop()
+val code = setu.pair()               // suspend; solo mode
+setu.stop()
 ```
 
-In corporate mode, the relay URL, enrollment token and policy come from EMM managed configuration. Device-side audit records then appear on `genadb.auditEvents`.
+In corporate mode, the relay URL, enrollment token and policy come from EMM managed configuration. Device-side audit records then appear on `setu.auditEvents`.
 
-Build the library with `./gradlew :genadb-android:assembleRelease`, which writes `genadb-android/build/outputs/aar/genadb-android.aar`. The build cross-compiles the Go core, so Go 1.24+ must be on `PATH`.
+Build the library with `./gradlew :genadb-android:assembleRelease`, which writes `genadb-android/build/outputs/aar/setu-android-1.0.1.aar`. The AAR carries `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES.txt` under `assets/setu-sdk/`. The build cross-compiles the Go core, so Go 1.24+ must be on `PATH`.
 
 ## Audit and reports
 
@@ -247,12 +255,13 @@ In corporate mode every session and ADB operation is recorded. Each record names
 - bytes in each direction and the duration
 - the SHA-256 of pushed and pulled files
 
-Records never contain passwords, tokens, pairing codes, command arguments or file contents. The log is append-only JSONL, and each record carries the hash of the previous one, so editing, deleting or reordering any record is detectable.
+Records never contain passwords, tokens, pairing codes, command arguments or file contents. The log is append-only JSONL, and each record carries the hash of the previous one, so editing, inserting or reordering records breaks the chain. A signed anchor file next to the log (`audit.anchor`, keyed by `audit-anchor.key`) pins its first and last records, so deleting records from either end is detected too. Someone who holds the anchor key and can rewrite both files could still forge history: keep the key on another volume (`--audit-anchor-key-file`) and forward records to a collector as the copy of last resort.
 
 ```bash
-genadb audit verify --log audit.jsonl
-genadb audit report --log audit.jsonl --format html --since 168h --out weekly.html
-genadb audit report --log audit.jsonl --format csv   # one row per record, spreadsheet-safe
+setu audit verify --log audit.jsonl
+setu audit report --log audit.jsonl --format html --since 168h --out weekly.html
+setu audit report --log audit.jsonl --format csv   # one row per record, spreadsheet-safe
+setu audit rotate --log audit.jsonl --to audit-2026-11.jsonl   # archive; the chain continues
 ```
 
 Records can also be forwarded to a SIEM or collector as they happen (`--audit-webhook-url`), with each delivery signed with HMAC-SHA256.
@@ -279,12 +288,12 @@ These figures come from the locked evaluation harness (`eval.py`, a simulated WA
 
 | Path | What |
 |---|---|
-| `core/cmd/genadb` | CLI: `relay`, `device`, `connect`, `keygen`, `doctor`, `audit`, `version` |
-| `core/cmd/genadb-daemon` | JSON-RPC 2.0 daemon for IDE plugins and UIs |
+| `core/cmd/setu`, `core/cmd/genadb` | CLI: `relay`, `device`, `connect`, `keygen`, `doctor`, `audit`, `version` (two names, one program) |
+| `core/cmd/setu-daemon`, `core/cmd/genadb-daemon` | JSON-RPC 2.0 daemon for IDE plugins and UIs |
 | `core/pkg/genadb` | Public Go SDK |
 | `core/pkg/genadb/audit` | Hash-chained audit log, reports, webhook sink |
 | `core/internal/…` | Engine: transport, tunnel, policy (not public API) |
-| `android/genadb-android` | Android SDK (AAR) |
+| `android/genadb-android` | Android SDK (`setu-android` AAR) |
 | `android/agent-protocol` | Platform-neutral Kotlin half of the SDK, JVM-tested |
 | `android/app` | Companion app built on the SDK |
 | `eval.py`, `harness/` | Locked evaluation harness |
@@ -293,8 +302,9 @@ These figures come from the locked evaluation harness (`eval.py`, a simulated WA
 ## Building and testing
 
 ```bash
-cd core && go vet ./... && go test ./...      # Go SDK, engine, daemon, audit
+cd core && go vet ./... && go test -race ./... # Go SDK, engine, daemon, audit, notices
 python3 eval.py                               # end-to-end evaluation (builds via solution.py)
+python3 tests/repo_hygiene.py                 # no compiled binaries tracked in git
 cd android && ./gradlew :agent-protocol:test  # Kotlin SDK logic, no Android SDK needed
 cd android && ./gradlew :genadb-android:assembleRelease :app:assembleDebug
 ```
