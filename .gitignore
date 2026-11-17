@@ -1,3 +1,19 @@
+# Build output and local runs
 build/
+dist/
 run.log
 __pycache__/
+
+# Compiled binaries: never commit them (release assets are built from tags)
+/core/genadb
+/core/genadb-daemon
+/core/setu
+/core/setu-daemon
+/core/genadb-testidp
+*.exe
+*.so
+*.dylib
+*.aar
+*.apk
+*.test
+
