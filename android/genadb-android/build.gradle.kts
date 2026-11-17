@@ -2,6 +2,8 @@
 // and the models / interfaces it exposes. Build: ./gradlew :genadb-android:assembleRelease
 // -> genadb-android/build/outputs/aar/setu-android-<version>.aar
 // (The Gradle module keeps its pre-rename path so existing builds keep working.)
+import java.util.zip.ZipFile
+
 plugins {
     id("com.android.library")
     kotlin("android")
@@ -92,10 +94,12 @@ val namedAar by tasks.registering(Copy::class) {
     into(layout.buildDirectory.dir("outputs/aar"))
     rename { "setu-android-$setuVersion.aar" }
     doFirst {
-        val entries = java.util.zip.ZipFile(releaseAar.get().asFile).use { z -> z.entries().toList().map { it.name }.toSet() }
+        val entries: Set<String> = ZipFile(releaseAar.get().asFile).use { z ->
+            z.entries().toList().map { e -> e.name }.toSet()
+        }
         val required = listOf("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.txt").map { "assets/setu-sdk/$it" } +
             goTargets.keys.map { "jni/$it/libgenadb.so" }
-        val missing = required.filterNot(entries::contains)
+        val missing = required.filterNot { it in entries }
         check(missing.isEmpty()) { "release AAR is missing $missing" }
     }
 }
