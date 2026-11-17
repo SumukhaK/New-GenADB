@@ -47,24 +47,24 @@ internal class ManagerCore(
     private val lock = Any()
     private var job: Job? = null
     private var proc: AgentProcess? = null
-    private var config: GenAdbConfig? = null
+    private var config: SetuConfig? = null
     private var audit: AuditSink? = null
     private var deviceId: String? = null
 
     val auditFile: File get() = File(stateDir, "audit.jsonl")
 
-    fun configure(cfg: GenAdbConfig) = synchronized(lock) { config = cfg }
+    fun configure(cfg: SetuConfig) = synchronized(lock) { config = cfg }
 
     fun refreshPolicy(): PolicyStatus {
-        val cfg = synchronized(lock) { config } ?: GenAdbConfig(relayUrl = "")
+        val cfg = synchronized(lock) { config } ?: SetuConfig(relayUrl = "")
         return effective(cfg, policyProvider.current()).policy.also { _policy.value = it }
     }
 
-    fun start(cfg: GenAdbConfig?) {
+    fun start(cfg: SetuConfig?) {
         synchronized(lock) {
             if (cfg != null) config = cfg
             // Managed configuration alone (relay from EMM) is enough to start.
-            val c = config ?: GenAdbConfig(relayUrl = "")
+            val c = config ?: SetuConfig(relayUrl = "")
             val eff = effective(c, policyProvider.current())
             if (eff.config.relayUrl.isBlank()) throw GenAdbException.NotConfigured()
             stopLocked(record = false)

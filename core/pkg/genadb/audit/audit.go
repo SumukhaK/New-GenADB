@@ -18,7 +18,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -118,13 +117,39 @@ func canonicalJSON(m map[string]any) ([]byte, error) {
 }
 
 // FileSink appends hash-chained records to a JSONL file, continuing an
-// existing chain if the file already has records.
+// existing chain if the file already has records, and keeps the log's signed
+// anchor (see Anchor) up to date.
+//
+// Several processes may append to one log: each record is written under an
+// exclusive file lock (on Unix), and a writer that finds the file grown by
+// someone else, or rotated by RotateFile, re-reads the tail and continues
+// the chain from there.
 type FileSink struct {
-	mu    sync.Mutex
-	f     *os.File
-	chain *Chain
-	sync  bool
-	tees  []Sink
+	mu         sync.Mutex
+	f          *os.File
+	path       string
+	chain      *Chain
+	sync       bool
+	tees       []Sink
+	anchorPath string // "" when anchoring is off
+	key        []byte
+	anchor     *Anchor
+	size       int64 // file size after our last write or refresh
+}
+
+// FileOptions configures OpenFileWith.
+type FileOptions struct {
+	// Sync fsyncs every record (and its anchor) before Write returns.
+	Sync bool
+	// AnchorKey signs the anchor. When nil, the key is read from
+	// AnchorKeyFile, which is created with a random key if missing.
+	AnchorKey []byte
+	// AnchorKeyFile defaults to DefaultAnchorKeyPath(path). Keep it on a
+	// different volume from the log for stronger protection.
+	AnchorKeyFile string
+	// NoAnchor turns the anchor off (the chain alone then cannot reveal
+	// records deleted from either end of the log).
+	NoAnchor bool
 }
 
 // Tee forwards every record, after it is sealed and written, to the given
@@ -134,48 +159,174 @@ type FileSink struct {
 // (the built-in webhook sink and the SDK's event tap only enqueue).
 func (s *FileSink) Tee(sinks ...Sink) { s.tees = append(s.tees, sinks...) }
 
-// OpenFile opens (or creates) a chained audit log. With syncEach, every
-// record is fsynced before Write returns.
+// OpenFile opens (or creates) a chained, anchored audit log with the default
+// anchor key. With syncEach, every record is fsynced before Write returns.
 func OpenFile(path string, syncEach bool) (*FileSink, error) {
-	seq, prev, err := lastLink(path)
-	if err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	return &FileSink{f: f, chain: NewChain(seq, prev), sync: syncEach}, nil
+	return OpenFileWith(path, FileOptions{Sync: syncEach})
 }
 
-func lastLink(path string) (int64, string, error) {
-	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, "", nil
+// OpenFileWith opens (or creates) a chained audit log. It refuses a log that
+// no longer matches its anchor (ErrAnchorMismatch) or whose anchor fails its
+// signature check (ErrAnchorSignature): appending would bury the evidence.
+// A log without an anchor (new, or written by an older version) is anchored
+// from its current first and last records.
+func OpenFileWith(path string, opt FileOptions) (*FileSink, error) {
+	s := &FileSink{path: path, sync: opt.Sync}
+	if !opt.NoAnchor {
+		s.anchorPath, s.key = AnchorPath(path), opt.AnchorKey
+		if s.key == nil {
+			kp := opt.AnchorKeyFile
+			if kp == "" {
+				kp = DefaultAnchorKeyPath(path)
+			}
+			k, err := LoadOrCreateAnchorKey(kp)
+			if err != nil {
+				return nil, err
+			}
+			s.key = k
+		}
 	}
+	if err := s.open(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// open opens s.path and loads its state under the file lock.
+func (s *FileSink) open() error {
+	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o600)
 	if err != nil {
-		return 0, "", err
+		return err
 	}
-	defer f.Close()
-	var seq int64
-	prev := ""
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64<<10), 4<<20)
-	for sc.Scan() {
-		var e struct {
-			Seq  int64  `json:"seq"`
-			Hash string `json:"event_hash"`
+	if err := lockFile(f); err != nil {
+		f.Close()
+		return err
+	}
+	defer unlockFile(f)
+	old := s.f
+	s.f = f
+	if err := s.refresh(); err != nil {
+		s.f = old
+		f.Close()
+		return err
+	}
+	if old != nil {
+		old.Close()
+	}
+	return nil
+}
+
+// refresh re-reads the log's tail and anchor. The caller holds the file lock.
+func (s *FileSink) refresh() error {
+	st, err := s.f.Stat()
+	if err != nil {
+		return err
+	}
+	size := st.Size()
+	if size > 0 {
+		// A writer that crashed mid-record leaves a partial last line;
+		// finish it so the next record starts on a line of its own.
+		last := make([]byte, 1)
+		if _, err := s.f.ReadAt(last, size-1); err != nil {
+			return err
 		}
-		if json.Unmarshal(sc.Bytes(), &e) == nil && e.Hash != "" {
-			seq, prev = e.Seq, e.Hash
+		if last[0] != '\n' {
+			if _, err := s.f.Write([]byte{'\n'}); err != nil {
+				return err
+			}
+			size++
 		}
 	}
-	return seq, prev, sc.Err()
+	var a *Anchor
+	if s.anchorPath != "" {
+		if a, err = ReadAnchor(s.anchorPath); err != nil {
+			return err
+		}
+		if a != nil && !a.Valid(s.key) {
+			return fmt.Errorf("%w: %s", ErrAnchorSignature, s.anchorPath)
+		}
+	}
+	var want int64
+	if a != nil {
+		want = a.LastSeq
+	}
+	in, err := scanLog(s.path, want)
+	if err != nil {
+		return err
+	}
+	if s.anchorPath != "" {
+		if a == nil {
+			a = &Anchor{FirstPrevHash: GenesisHash, LastHash: GenesisHash}
+			if in.records > 0 {
+				a = &Anchor{FirstSeq: in.firstSeq, FirstPrevHash: in.firstPrev, FirstHash: in.firstHash,
+					LastSeq: in.lastSeq, LastHash: in.lastHash}
+			}
+			if err := writeAnchor(s.anchorPath, a, s.key, s.sync); err != nil {
+				return err
+			}
+		} else if err := a.check(in); err != nil {
+			return fmt.Errorf("%w (%s); preserve both files for investigation, or rotate them away to start a new log", err, s.path)
+		}
+	}
+	switch {
+	case in.records > 0:
+		s.chain = NewChain(in.lastSeq, in.lastHash)
+	case a != nil:
+		s.chain = NewChain(a.LastSeq, a.LastHash)
+	default:
+		s.chain = NewChain(0, "")
+	}
+	s.anchor, s.size = a, size
+	return nil
+}
+
+// catchUp re-reads state if another writer changed the log since our last
+// write, or reopens it if it was rotated. The caller holds s.mu and the
+// file lock on s.f, and must re-lock if this returns rotated == true.
+func (s *FileSink) catchUp() (rotated bool, err error) {
+	cur, err := os.Stat(s.path)
+	if err == nil {
+		mine, err := s.f.Stat()
+		if err != nil {
+			return false, err
+		}
+		if !os.SameFile(cur, mine) {
+			return true, nil
+		}
+		if mine.Size() != s.size {
+			return false, s.refresh()
+		}
+		return false, nil
+	}
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	return false, err
 }
 
 func (s *FileSink) Write(e Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for tries := 0; ; tries++ {
+		if err := lockFile(s.f); err != nil {
+			return err
+		}
+		rotated, err := s.catchUp()
+		if err == nil && !rotated {
+			break
+		}
+		unlockFile(s.f)
+		if err != nil {
+			return err
+		}
+		if tries == 3 {
+			return errorf("%s keeps changing underneath the writer", s.path)
+		}
+		if err := s.open(); err != nil { // rotated: continue in the new file
+			return err
+		}
+	}
+	defer unlockFile(s.f)
 	sealed, err := s.chain.Seal(e)
 	if err != nil {
 		return err
@@ -184,11 +335,23 @@ func (s *FileSink) Write(e Event) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.f.Write(append(b, '\n')); err != nil {
+	n, err := s.f.Write(append(b, '\n'))
+	s.size += int64(n)
+	if err != nil {
 		return err
 	}
 	if s.sync {
 		if err := s.f.Sync(); err != nil {
+			return err
+		}
+	}
+	if a := s.anchor; a != nil {
+		seq, hash := seqOf(sealed), sealed["event_hash"].(string)
+		if a.FirstSeq == 0 {
+			a.FirstSeq, a.FirstPrevHash, a.FirstHash = seq, sealed["prev_event_hash"].(string), hash
+		}
+		a.LastSeq, a.LastHash = seq, hash
+		if err := writeAnchor(s.anchorPath, a, s.key, s.sync); err != nil {
 			return err
 		}
 	}
@@ -200,7 +363,9 @@ func (s *FileSink) Write(e Event) error {
 
 // Close closes the file and every tee.
 func (s *FileSink) Close() error {
+	s.mu.Lock()
 	err := s.f.Close()
+	s.mu.Unlock()
 	for _, t := range s.tees {
 		t.Close()
 	}
@@ -278,11 +443,23 @@ type ChainStatus struct {
 	Problem   string `json:"problem,omitempty"`
 	LastHash  string `json:"last_hash,omitempty"`
 	Unchained int    `json:"unchained,omitempty"` // records written without a chain (legacy)
+	// FirstSeq is the seq of the oldest chained record, and StartsAtGenesis
+	// whether it links to GenesisHash. A log that does not start at genesis
+	// was rotated, or lost its oldest records; only an anchor tells which.
+	FirstSeq        int64 `json:"first_seq,omitempty"`
+	StartsAtGenesis bool  `json:"starts_at_genesis"`
+	// Anchor is set by VerifyFile: verified, unverified (no key), invalid or none.
+	Anchor   string   `json:"anchor,omitempty"`
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // Verify checks every link in the chain. Records without event_hash (written
 // by older versions) are counted but make the log invalid only if they occur
 // after chained records.
+//
+// The first chained record may link to any hash, so that rotated logs
+// verify; the chain therefore cannot show that records are missing from
+// either end. VerifyFile adds that check using the log's anchor.
 func Verify(events []Event) ChainStatus {
 	st := ChainStatus{Valid: true, Records: len(events)}
 	prev := ""
@@ -290,7 +467,7 @@ func Verify(events []Event) ChainStatus {
 		h, _ := e["event_hash"].(string)
 		if h == "" {
 			if prev != "" {
-				return ChainStatus{Records: len(events), BrokenAt: i + 1, Problem: "record without a hash inside the chain"}
+				return st.broken(i, "record without a hash inside the chain")
 			}
 			st.Unchained++
 			continue
@@ -299,17 +476,23 @@ func Verify(events []Event) ChainStatus {
 		want := prev
 		if want == "" {
 			want = p // first chained record: accept whatever it links to (log rotation)
+			st.FirstSeq, st.StartsAtGenesis = seqOf(e), p == GenesisHash
 		}
 		if p != want {
-			return ChainStatus{Records: len(events), BrokenAt: i + 1, Problem: "prev_event_hash does not match the previous record"}
+			return st.broken(i, "prev_event_hash does not match the previous record")
 		}
 		got, err := hashEvent(e)
 		if err != nil || got != h {
-			return ChainStatus{Records: len(events), BrokenAt: i + 1, Problem: "record content does not match its event_hash"}
+			return st.broken(i, "record content does not match its event_hash")
 		}
 		prev = h
 	}
 	st.LastHash = prev
+	return st
+}
+
+func (st ChainStatus) broken(i int, problem string) ChainStatus {
+	st.Valid, st.BrokenAt, st.Problem, st.Unchained = false, i+1, problem, 0
 	return st
 }
 

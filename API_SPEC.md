@@ -1,39 +1,50 @@
-# New-GenADB API specification
+# Setu (Setu-SDK) API specification
 
-Version 0.4.0. This document is the contract for front ends, including the separate `genadb-ui` repository, IDE plugins and device-lab tooling. It covers four surfaces:
+Version 1.0.1. Setu is an encrypted bridge between your IDE and any Android device, anywhere. This document is the contract for front ends, including the separate `genadb-ui` repository, IDE plugins and device-lab tooling. It covers four surfaces:
 
 1. [Go SDK](#1-go-sdk-pkggenadb): `github.com/sumukhak/new-genadb/core/pkg/genadb`
-2. [Daemon JSON-RPC protocol](#2-daemon-json-rpc-20-protocol): `genadb-daemon`
+2. [Daemon JSON-RPC protocol](#2-daemon-json-rpc-20-protocol): `setu-daemon`
 3. [Audit record and report schema](#3-audit-record-and-report-schema)
-4. [Android SDK](#4-android-sdk-genadb-android): `dev.genadb.sdk.GenAdbManager`
+4. [Android SDK](#4-android-sdk-setu-android): `dev.genadb.sdk.SetuManager`
 
-The CLI's JSON-lines events (`genadb device` and `genadb connect` print one JSON object per line on stdout) use the same event names as section 1.4.
+The CLI's JSON-lines events (`setu device` and `setu connect` print one JSON object per line on stdout) use the same event names as section 1.4.
 
 Compatibility: within 0.x, fields and methods may be added, never renamed or removed without a minor version bump. Clients must ignore unknown fields and event types.
 
 ---
 
+**Names before v1.0.1.** The project was called New-GenADB until v1.0.1. Every old name still works, and new code should use the Setu names:
+
+| Before 1.0.1 | Since 1.0.1 | Compatibility |
+|---|---|---|
+| `genadb`, `genadb-daemon` | `setu`, `setu-daemon` | Same programs: identical flags, output and exit codes |
+| `genadb.Client`, `genadb.Session` | `genadb.SetuClient`, `genadb.SetuSession` | Type aliases: the same types |
+| `GenAdbManager` | `SetuManager` | Deprecated subclass with the same Builder and companion, sharing the process-wide instance |
+| `GenAdbConfig` | `SetuConfig` | Deprecated typealias |
+
+The Go module path, the Kotlin package `dev.genadb.sdk`, the state directories, the `GENADB_*` environment variables, the `X-GenADB-*` webhook headers and the wire protocol are unchanged.
+
 ## 1. Go SDK (`pkg/genadb`)
 
-### 1.1 Client
+### 1.1 SetuClient
 
 ```go
-func New(opts ...Option) (*Client, error)
+func New(opts ...Option) (*SetuClient, error)
 
-func (c *Client) Connect(ctx context.Context, req ConnectRequest) (*Session, error)
-func (c *Client) Session(id string) (*Session, bool)
-func (c *Client) Sessions() []*Session                       // live sessions, oldest first
-func (c *Client) Devices(ctx context.Context) ([]DeviceInfo, error)
-func (c *Client) Forget(deviceID string) error               // drop a pairing
-func (c *Client) PublicKey() (string, error)                 // identity key that token issuers bind to
-func (c *Client) ExportAuditReport(w io.Writer, f audit.Format, opt audit.Options) error
-func (c *Client) Doctor(ctx context.Context) DoctorReport
-func (c *Client) HostDevice(ctx context.Context, h HostConfig) error   // device side
-func (c *Client) Events() <-chan Event
-func (c *Client) Mode() Mode
-func (c *Client) StateDir() string
-func (c *Client) AuditPath() string                          // "" when audit is off
-func (c *Client) Close() error                               // stops sessions, closes audit
+func (c *SetuClient) Connect(ctx context.Context, req ConnectRequest) (*SetuSession, error)
+func (c *SetuClient) Session(id string) (*SetuSession, bool)
+func (c *SetuClient) Sessions() []*SetuSession                       // live sessions, oldest first
+func (c *SetuClient) Devices(ctx context.Context) ([]DeviceInfo, error)
+func (c *SetuClient) Forget(deviceID string) error               // drop a pairing
+func (c *SetuClient) PublicKey() (string, error)                 // identity key that token issuers bind to
+func (c *SetuClient) ExportAuditReport(w io.Writer, f audit.Format, opt audit.Options) error
+func (c *SetuClient) Doctor(ctx context.Context) DoctorReport
+func (c *SetuClient) HostDevice(ctx context.Context, h HostConfig) error   // device side
+func (c *SetuClient) Events() <-chan Event
+func (c *SetuClient) Mode() Mode
+func (c *SetuClient) StateDir() string
+func (c *SetuClient) AuditPath() string                          // "" when audit is off
+func (c *SetuClient) Close() error                               // stops sessions, closes audit
 ```
 
 `ConnectRequest`:
@@ -46,16 +57,16 @@ func (c *Client) Close() error                               // stops sessions, 
 
 `Connect` returns once the local endpoint is listening, or with the first error; it never retries before the session is up. A mistyped, expired or burned pairing code fails fast with `ErrBadCode`, and a relay that does not answer within 20 s fails with `ErrUnavailable`. If `ctx` ends first, the error wraps `ctx.Err()` and the last session error.
 
-### 1.2 Session
+### 1.2 SetuSession
 
 ```go
-func (s *Session) ID() string            // "s1", "s2", … unique per Client
-func (s *Session) ADBAddr() string       // pass to `adb connect`
-func (s *Session) DeviceID() string
-func (s *Session) Started() time.Time
-func (s *Session) Done() <-chan struct{}
-func (s *Session) Err() error            // blocks until done; nil after Stop
-func (s *Session) Stop()                 // ends the session and waits
+func (s *SetuSession) ID() string            // "s1", "s2", … unique per SetuClient
+func (s *SetuSession) ADBAddr() string       // pass to `adb connect`
+func (s *SetuSession) DeviceID() string
+func (s *SetuSession) Started() time.Time
+func (s *SetuSession) Done() <-chan struct{}
+func (s *SetuSession) Err() error            // blocks until done; nil after Stop
+func (s *SetuSession) Stop()                 // ends the session and waits
 ```
 
 When a session is restarted under its reconnect policy, it keeps the same `ADBAddr`, so IDEs keep working.
@@ -86,6 +97,9 @@ When a session is restarted under its reconnect policy, it keeps the same `ADBAd
 | `Path` | Log file. The default is `<state>/audit.jsonl` |
 | `WebhookURL`, `WebhookSecret` | Forward every sealed record, signed (section 3.4) |
 | `Sinks` | Extra `AuditSink`s; each receives the sealed records |
+| `AnchorKeyFile` | Key that signs the log's anchor (section 3.3.1). The default is `audit-anchor.key` next to the log, created on first use |
+
+The command line follows the same rule: in corporate mode (or whenever `--identity` is given), `setu connect` logs to `<state>/audit.jsonl` and `setu relay` to `<state>/relay-audit.jsonl` unless `--audit PATH` names another file, and `--audit=off` is refused. Both take `--audit-anchor-key-file`. `setu audit verify|report|rotate` accept `--anchor-key-file`.
 
 ### 1.4 Interfaces
 
@@ -151,13 +165,13 @@ type DoctorReport struct { Version, Platform string; OK bool; Checks []Check }
 type Check struct { Name string; Status CheckStatus; Detail, Hint string }  // ok | warn | fail | skip
 ```
 
-The checks are `adb`, `state`, `paired_devices`, `proxy_env`, `relay_dns`, `relay_reach` and `audit_log`. They never send credentials. Proxy credentials are not printed. `genadb doctor [--json]` prints the same report.
+The checks are `adb`, `state`, `paired_devices`, `proxy_env`, `relay_dns`, `relay_reach` and `audit_log`. They never send credentials. Proxy credentials are not printed. `setu doctor [--json]` prints the same report.
 
 ---
 
 ## 2. Daemon JSON-RPC 2.0 protocol
 
-`genadb-daemon` wraps one `Client`. Transport:
+`setu-daemon` (or `genadb-daemon`) wraps one `SetuClient`. Transport:
 
 - **TCP (default)**: `127.0.0.1:7605`. Only loopback addresses are accepted. The first call on each connection must be `auth` with the token from `<state>/daemon.token`, a file with mode 0600 created on first start.
 - **stdio** (`--stdio`): a single client on stdin and stdout, with no token. Use it when the daemon is a child process of the UI.
@@ -168,7 +182,7 @@ Startup flags mirror the CLI:
 
 ```
 --relay, --state, --mode solo|corporate, --identity-file, --policy,
---audit auto|on|off, --audit-log, --audit-webhook-url, --audit-webhook-secret-file,
+--audit auto|on|off, --audit-log, --audit-anchor-key-file, --audit-webhook-url, --audit-webhook-secret-file,
 --proxy, --relay-ca, --relay-pin, --listen, --stdio
 ```
 
@@ -290,7 +304,7 @@ Never recorded: tokens, pairing codes, passwords, command arguments, environment
 
 ### 3.2 Report (JSON)
 
-`genadb audit report --format json`, `Client.ExportAuditReport(…, audit.FormatJSON, …)` and the daemon's `audit.report` all produce this object. The example below is checked field for field against the code by `TestReportMatchesAPISpec` (`core/pkg/genadb/audit`), so it is the contract.
+`setu audit report --format json`, `SetuClient.ExportAuditReport(…, audit.FormatJSON, …)` and the daemon's `audit.report` all produce this object. The example below is checked field for field against the code by `TestReportMatchesAPISpec` (`core/pkg/genadb/audit`), so it is the contract.
 
 ```json
 {
@@ -300,7 +314,9 @@ Never recorded: tokens, pairing codes, passwords, command arguments, environment
   "until": "2026-11-17T00:00:00Z",
   "first_event": "2026-11-10T08:00:00Z",
   "last_event": "2026-11-16T18:30:00Z",
-  "chain": { "valid": true, "records": 812, "broken_at": 0, "problem": "", "last_hash": "9f2c…", "unchained": 0 },
+  "chain": { "valid": true, "records": 812, "broken_at": 0, "problem": "", "last_hash": "9f2c…", "unchained": 0,
+             "first_seq": 1, "starts_at_genesis": true, "anchor": "verified",
+             "warnings": ["1 record(s) after the anchor (a writer stopped between the record and the anchor update)"] },
   "totals": { "records": 812, "sessions": 40, "operations": 655, "denials": 3, "revocations": 1,
               "bytes_up": 734003200, "bytes_down": 52428800, "users": 4, "devices": 6 },
   "by_user":   [ { "key": "alice", "sessions": 10, "operations": 200, "denials": 0, "bytes_up": 1048576, "bytes_down": 2048 } ],
@@ -334,7 +350,22 @@ Cells that a spreadsheet would treat as formulas are neutralised with a leading 
 
 ### 3.3 Chain status
 
-`{valid, records, broken_at?, problem?, last_hash?, unchained?}`. `broken_at` is the 1-based index of the first record that fails verification.
+`{valid, records, broken_at?, problem?, last_hash?, unchained?, first_seq?, starts_at_genesis, anchor?, warnings?}`. `broken_at` is the 1-based index of the first record that fails verification. `first_seq` is the seq of the oldest chained record, and `starts_at_genesis` says whether it links to the all-zero genesis hash.
+
+`anchor` is reported when the log is verified from disk (`audit verify`, the daemon's `audit.verify`, `doctor`): `verified`, `unverified` (the anchor key is not available, so positions are checked but not the signature), `invalid` or `none`.
+
+### 3.3.1 Anchor file
+
+The hash chain shows that the records present are intact and in order, but not that none are missing at either end: removing the oldest or newest lines leaves a shorter chain that still verifies. Every log therefore has an anchor next to it (`audit.jsonl` → `audit.anchor`), rewritten after each record:
+
+```json
+{ "version": 1, "first_seq": 1, "first_prev_event_hash": "0000…", "first_event_hash": "ab12…",
+  "last_seq": 812, "last_event_hash": "9f2c…", "updated": "2026-11-17T10:00:00Z", "mac": "<hex>" }
+```
+
+`mac` is HMAC-SHA256 over `"setu-audit-anchor-v1\n"` followed by the anchor's JSON without `mac`. The key is 32 random bytes, hex-encoded, in `audit-anchor.key` in the log's directory (mode 0600, created on first use), or a file of your choice. Verification fails when the log's first record is not the anchored one (the oldest records were deleted), when it ends before the anchored last record (the newest records were deleted), when the log is empty or missing but its anchor is not, or when the MAC does not match. Writers refuse to append to such a log. A log written by an older version is anchored from its current contents the first time it is opened.
+
+The anchor defeats anyone who cannot forge its MAC. Someone who holds the key and can write both files can still rewrite history, so keep the key on another volume, and use the webhook (3.4) or a SIEM copy as the record of last resort. `audit rotate` moves a log and its anchor aside and starts a new log whose chain continues from the old one.
 
 ### 3.4 Webhook delivery
 
@@ -349,39 +380,42 @@ Delivery is asynchronous, in order, and retried with backoff. Collectors should 
 
 ---
 
-## 4. Android SDK (`genadb-android`)
+## 4. Android SDK (`setu-android`)
 
-Package: `dev.genadb.sdk`. The minimum SDK is 29. The library is built in Kotlin explicit-API mode, so everything not listed here is internal.
+Artifact: `setu-android-1.0.1.aar` (Gradle module `:genadb-android`). Package: `dev.genadb.sdk`. The minimum SDK is 29. The AAR carries `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES.txt` under `assets/setu-sdk/`, so apps that embed it ship the required notices. The library is built in Kotlin explicit-API mode, so everything not listed here is internal.
 
 Consuming apps must keep native libraries extracted, because the agent runs as an executable: set `packaging { jniLibs { useLegacyPackaging = true } }`. Run the agent from a foreground service.
 
-### 4.1 GenAdbManager
+### 4.1 SetuManager
 
 ```kotlin
-class GenAdbManager {
+open class SetuManager {
     val connectionState: StateFlow<ConnectionState>
     val policyStatus: StateFlow<PolicyStatus>
     val auditEvents: StateFlow<AuditEvent?>          // latest record
     val recentAuditEvents: StateFlow<List<AuditEvent>>  // last 200
     val auditLogFile: File?
 
-    fun start(config: GenAdbConfig? = null)          // throws GenAdbException.NotConfigured
+    fun start(config: SetuConfig? = null)            // throws GenAdbException.NotConfigured
     suspend fun pair(timeoutMs: Long = 30_000): String
     fun stop()
     fun status(): GenAdbStatus
     fun refreshPolicy(): PolicyStatus                // on ACTION_APPLICATION_RESTRICTIONS_CHANGED
 
-    class Builder(context: Context) {
-        fun config(GenAdbConfig); fun agentLauncher(AgentLauncher)
+    open class Builder(context: Context) {
+        fun config(SetuConfig); fun agentLauncher(AgentLauncher)
         fun policyProvider(PolicyProvider); fun networkInfoProvider(NetworkInfoProvider)
         fun auditSink(AuditSink); fun stateDir(File); fun scope(CoroutineScope)
-        fun build(): GenAdbManager
+        fun build(): SetuManager
     }
     companion object {
-        fun initialize(builder: Builder): GenAdbManager   // process-wide instance
-        fun getInstance(context: Context): GenAdbManager  // defaults on first use
+        fun initialize(builder: Builder): SetuManager     // process-wide instance
+        fun getInstance(context: Context): SetuManager    // defaults on first use
     }
 }
+
+@Deprecated class GenAdbManager : SetuManager        // pre-1.0.1 name; GenAdbManager.Builder builds one
+@Deprecated typealias GenAdbConfig = SetuConfig
 ```
 
 `pair()` can throw `GenAdbException.PairingUnavailable` (corporate mode), `GenAdbException.PolicyMissing`, `GenAdbException.Blocked` or `GenAdbException.Timeout`.
@@ -391,7 +425,7 @@ Corporate configuration that is incomplete (an enrollment token without a policy
 ### 4.2 Models
 
 ```kotlin
-data class GenAdbConfig(relayUrl: String, mode: Mode = SOLO, adbd: String = "auto",
+data class SetuConfig(relayUrl: String, mode: Mode = SOLO, adbd: String = "auto",
     lanListen: String? = "0.0.0.0:47100", enrollmentToken: String? = null,
     policyJson: String? = null, relayPin: String? = null, proxy: String? = null,
     audit: AuditMode = AUTO)
@@ -409,7 +443,7 @@ data class GenAdbStatus(connection, policy, running, auditLogPath)
 enum class Mode { SOLO, CORPORATE };  enum class AuditMode { AUTO, ON, OFF }
 ```
 
-Managed configuration takes precedence over `GenAdbConfig`. The EMM keys are:
+Managed configuration takes precedence over `SetuConfig`. The EMM keys are:
 
 | Key | Effect |
 |---|---|
@@ -418,7 +452,7 @@ Managed configuration takes precedence over `GenAdbConfig`. The EMM keys are:
 | `policy_json` | Organisation policy |
 | `relay_pin` | Relay certificate pin |
 
-`UserManager.DISALLOW_DEBUGGING_FEATURES` produces `ConnectionState.Blocked`. In corporate mode, audit is always on. The device log at `auditLogFile` uses the schema in section 3, and `genadb audit verify` and `genadb audit report` read it.
+`UserManager.DISALLOW_DEBUGGING_FEATURES` produces `ConnectionState.Blocked`. In corporate mode, audit is always on. The device log at `auditLogFile` uses the schema in section 3, and `setu audit verify` and `setu audit report` read it.
 
 ### 4.3 Injection points
 

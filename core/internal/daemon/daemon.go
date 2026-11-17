@@ -442,11 +442,7 @@ func (s *Server) call(ctx context.Context, c *conn, req request) (any, error) {
 		if cl.AuditPath() == "" {
 			return nil, genadb.ErrAuditDisabled
 		}
-		evs, err := audit.ReadFile(cl.AuditPath())
-		if err != nil {
-			return nil, err
-		}
-		return audit.Verify(evs), nil
+		return audit.VerifyFile(cl.AuditPath(), audit.VerifyOptions{AnchorKeyFile: cl.AuditAnchorKeyFile()})
 	}
 	return nil, &Error{Code: CodeMethodNotFound, Message: fmt.Sprintf("method %q not found", req.Method)}
 }

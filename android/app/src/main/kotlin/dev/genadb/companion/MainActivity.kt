@@ -25,7 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.genadb.sdk.ConnectionState
-import dev.genadb.sdk.GenAdbManager
+import dev.genadb.sdk.SetuManager
 
 /** Minimal status screen; the product UI is out of scope for this milestone. */
 class MainActivity : ComponentActivity() {
@@ -43,12 +43,12 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun Screen() {
-        val genadb = remember { GenAdbManager.getInstance(this) }
-        val state by genadb.connectionState.collectAsStateWithLifecycle()
-        val policy by genadb.policyStatus.collectAsStateWithLifecycle()
+        val setu = remember { SetuManager.getInstance(this) }
+        val state by setu.connectionState.collectAsStateWithLifecycle()
+        val policy by setu.policyStatus.collectAsStateWithLifecycle()
         var relay by remember { mutableStateOf("wss://") }
         Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("GenADB Companion", style = MaterialTheme.typography.headlineSmall)
+            Text("Setu", style = MaterialTheme.typography.headlineSmall)
             Text("1. Enable Developer options → Wireless debugging.")
             Button(onClick = { startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) }) {
                 Text("Open developer options")

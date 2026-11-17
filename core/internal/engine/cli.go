@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 )
 
@@ -61,7 +62,9 @@ func cliRelay(ctx context.Context, args []string) error {
 	fs.StringVar(&c.Listen, "listen", "127.0.0.1:7000", "listen address")
 	fs.StringVar(&c.Mode, "mode", "solo", "solo|corporate")
 	fs.StringVar(&c.PolicyPath, "policy", "", "policy file (corporate)")
-	fs.StringVar(&c.AuditPath, "audit", "", "hash-chained audit log path (JSONL)")
+	fs.StringVar(&c.AuditPath, "audit", "", "hash-chained audit log path (JSONL); corporate default <state>/relay-audit.jsonl, and cannot be turned off")
+	fs.StringVar(&c.AuditKeyFile, "audit-anchor-key-file", "", "key that signs the audit log's anchor (default: audit-anchor.key next to the log)")
+	state := fs.String("state", ".", "directory for the relay's default audit log")
 	fs.StringVar(&c.AdminListen, "admin", "", "admin listen address")
 	fs.StringVar(&c.AdminToken, "admin-token", "", "admin bearer token")
 	fs.StringVar(&c.WSListen, "ws-listen", "", "also accept clients over WebSocket on this address (ws://, or wss:// with --tls-cert)")
@@ -72,12 +75,19 @@ func cliRelay(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	var err error
+	if c.AuditPath, err = resolveAuditPath(c.AuditPath, c.Mode == "corporate", filepath.Join(*state, "relay-audit.jsonl")); err != nil {
+		return err
+	}
 	hook, err := wh.sink()
 	if err != nil {
 		return err
 	}
 	if hook != nil {
 		c.Audit = hook
+	}
+	if c.AuditPath != "" {
+		logf("audit log: %s", c.AuditPath)
 	}
 	c.Events = StdoutEvents
 	return RunRelay(ctx, c)
@@ -117,7 +127,8 @@ func cliConnect(ctx context.Context, args []string) error {
 	fs.StringVar(&c.Device, "device", "", "previously paired device id")
 	fs.StringVar(&c.Identity, "identity", "", "user identity JWT (corporate)")
 	fs.StringVar(&c.PolicyPath, "policy", "", "policy file (corporate)")
-	auditPath := fs.String("audit", "", "record sessions and adb operations to this hash-chained JSONL file")
+	auditPath := fs.String("audit", "", "record sessions and adb operations to this hash-chained JSONL file; corporate default <state>/audit.jsonl, and cannot be turned off")
+	keyFile := fs.String("audit-anchor-key-file", "", "key that signs the audit log's anchor (default: audit-anchor.key next to the log)")
 	wh := addWebhookFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -126,7 +137,12 @@ func cliConnect(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	s, err := combineAudit(*auditPath, hook)
+	corporate := c.Mode == "corporate" || c.Identity != ""
+	path, err := resolveAuditPath(*auditPath, corporate, filepath.Join(c.State, "audit.jsonl"))
+	if err != nil {
+		return err
+	}
+	s, err := combineAudit(path, *keyFile, hook)
 	if err != nil {
 		return err
 	}

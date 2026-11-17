@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"context"
@@ -36,7 +36,7 @@ func cmdDoctor(args []string) int {
 		b, _ := json.MarshalIndent(r, "", "  ")
 		fmt.Println(string(b))
 	} else {
-		fmt.Printf("genadb %s (%s)\n", r.Version, r.Platform)
+		fmt.Printf("%s %s (%s)\n", prog, r.Version, r.Platform)
 		for _, c := range r.Checks {
 			fmt.Printf("  [%-4s] %-15s %s\n", c.Status, c.Name, c.Detail)
 			if c.Hint != "" && c.Status != genadb.CheckOK {

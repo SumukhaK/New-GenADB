@@ -16,7 +16,7 @@ public enum class AuditMode {
  * What the device agent should do. Values pushed by device management
  * (see [ManagedPolicy]) override these.
  */
-public data class GenAdbConfig(
+public data class SetuConfig(
     /** Relay: host:port, ws://host/path or wss://host/path. */
     val relayUrl: String,
     val mode: Mode = Mode.SOLO,
@@ -34,6 +34,10 @@ public data class GenAdbConfig(
     val proxy: String? = null,
     val audit: AuditMode = AuditMode.AUTO,
 )
+
+/** The pre-1.0.1 name of [SetuConfig]. */
+@Deprecated("Renamed to SetuConfig", ReplaceWith("SetuConfig", "dev.genadb.sdk.SetuConfig"))
+public typealias GenAdbConfig = SetuConfig
 
 /** Connection lifecycle of the device agent. */
 public sealed interface ConnectionState {
@@ -108,7 +112,7 @@ public data class GenAdbStatus(
 
 /** Typed failures. */
 public sealed class GenAdbException(message: String) : Exception(message) {
-    public class NotConfigured : GenAdbException("start() needs a GenAdbConfig with a relay URL")
+    public class NotConfigured : GenAdbException("start() needs a SetuConfig with a relay URL")
     public class Blocked(public val reason: String) : GenAdbException("debugging is disallowed by device policy: $reason")
     public class PairingUnavailable : GenAdbException("pairing codes exist only in solo mode")
     public class PolicyMissing(public val missing: String) : GenAdbException("corporate configuration incomplete: $missing is missing")

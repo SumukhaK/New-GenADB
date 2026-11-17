@@ -83,6 +83,7 @@ type RelayConfig struct {
 	Mode           string     // "solo" (default) or "corporate"
 	PolicyPath     string     // policy file (corporate)
 	AuditPath      string     // hash-chained JSONL audit log ("" = none)
+	AuditKeyFile   string     // anchor key ("" = audit-anchor.key next to the log)
 	Audit          audit.Sink // additional audit sink (e.g. a webhook)
 	AdminListen    string     // admin API listen address ("" = off)
 	AdminToken     string     // bearer token for the admin API
@@ -116,7 +117,7 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 	// record to any extra sink, so webhooks see exactly what the file holds.
 	switch {
 	case cfg.AuditPath != "":
-		f, err := audit.OpenFile(cfg.AuditPath, true)
+		f, err := audit.OpenFileWith(cfg.AuditPath, audit.FileOptions{Sync: true, AnchorKeyFile: cfg.AuditKeyFile})
 		if err != nil {
 			return err
 		}

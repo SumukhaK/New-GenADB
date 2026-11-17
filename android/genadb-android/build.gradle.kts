@@ -1,10 +1,15 @@
-// genadb-android: the Android SDK (AAR). Public API: dev.genadb.sdk.GenAdbManager
+// setu-android: the Setu Android SDK (AAR). Public API: dev.genadb.sdk.SetuManager
 // and the models / interfaces it exposes. Build: ./gradlew :genadb-android:assembleRelease
-// -> genadb-android/build/outputs/aar/genadb-android.aar
+// -> genadb-android/build/outputs/aar/setu-android-<version>.aar
+// (The Gradle module keeps its pre-rename path so existing builds keep working.)
+import java.util.zip.ZipFile
+
 plugins {
     id("com.android.library")
     kotlin("android")
 }
+
+val setuVersion = "1.0.1"
 
 android {
     namespace = "dev.genadb.sdk"
@@ -62,10 +67,40 @@ val buildGenadb by tasks.registering {
 }
 tasks.named("preBuild") { dependsOn(buildGenadb) }
 
-// Publish the release AAR under a stable name.
+// Licence notices travel inside the AAR (issue #6): LICENSE, NOTICE and
+// THIRD_PARTY_NOTICES.txt (full licence texts of what libgenadb.so links)
+// are packaged as assets/setu-sdk/*, so apps that embed the SDK ship them.
+val repoRoot = rootProject.projectDir.resolve("..")
+val noticesDir = layout.buildDirectory.dir("generated/setu-notices")
+val copyNotices by tasks.registering(Sync::class) {
+    group = "build"
+    description = "Copies LICENSE, NOTICE and THIRD_PARTY_NOTICES.txt into the AAR's assets"
+    from(repoRoot) { include("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.txt") }
+    into(noticesDir.map { it.dir("setu-sdk") })
+    doLast {
+        listOf("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.txt").forEach {
+            check(noticesDir.get().dir("setu-sdk").file(it).asFile.isFile) { "$it is missing from the repository root" }
+        }
+    }
+}
+android.sourceSets["main"].assets.srcDir(noticesDir)
+tasks.named("preBuild") { dependsOn(copyNotices) }
+
+// Publish the release AAR as setu-android-<version>.aar, after checking that
+// it carries the notices and both agent ABIs.
+val releaseAar = layout.buildDirectory.file("outputs/aar/genadb-android-release.aar")
 val namedAar by tasks.registering(Copy::class) {
-    from(layout.buildDirectory.file("outputs/aar/genadb-android-release.aar"))
+    from(releaseAar)
     into(layout.buildDirectory.dir("outputs/aar"))
-    rename { "genadb-android.aar" }
+    rename { "setu-android-$setuVersion.aar" }
+    doFirst {
+        val entries: Set<String> = ZipFile(releaseAar.get().asFile).use { z ->
+            z.entries().toList().map { e -> e.name }.toSet()
+        }
+        val required = listOf("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.txt").map { "assets/setu-sdk/$it" } +
+            goTargets.keys.map { "jni/$it/libgenadb.so" }
+        val missing = required.filterNot { it in entries }
+        check(missing.isEmpty()) { "release AAR is missing $missing" }
+    }
 }
 tasks.matching { it.name == "assembleRelease" }.configureEach { finalizedBy(namedAar) }

@@ -26,7 +26,7 @@ type HostConfig struct {
 // HostDevice registers this device with the relay and serves adb tunnels
 // until ctx is cancelled. Events: "pairing_code", "online", "blocked",
 // "adbd_endpoint", "adbd_unreachable".
-func (c *Client) HostDevice(ctx context.Context, h HostConfig) error {
+func (c *SetuClient) HostDevice(ctx context.Context, h HostConfig) error {
 	if c.cfg.relay == "" {
 		return ErrNoRelay
 	}

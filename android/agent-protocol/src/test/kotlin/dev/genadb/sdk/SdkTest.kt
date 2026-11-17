@@ -74,7 +74,7 @@ class AuditLogTest {
 class ProtocolTest {
     @Test
     fun soloArgs() {
-        val e = effective(GenAdbConfig("wss://relay.example/"), ManagedPolicy())
+        val e = effective(SetuConfig("wss://relay.example/"), ManagedPolicy())
         val args = agentArgs(e, "/data/state", null)
         assertEquals(listOf("device", "--relay", "wss://relay.example/", "--adbd", "auto", "--state", "/data/state",
             "--mode", "solo", "--lan-listen", "0.0.0.0:47100"), args)
@@ -84,7 +84,7 @@ class ProtocolTest {
     @Test
     fun managedConfigWinsAndForcesCorporateAudit() {
         val e = effective(
-            GenAdbConfig("wss://user.example/", audit = AuditMode.OFF),
+            SetuConfig("wss://user.example/", audit = AuditMode.OFF),
             ManagedPolicy(relayUrl = "wss://corp.example/", enrollmentToken = "ENROLL", policyJson = "{}", debuggingAllowed = false),
         )
         assertEquals(Mode.CORPORATE, e.policy.mode)
@@ -158,7 +158,7 @@ class ManagerCoreTest {
     fun soloLifecyclePairAuditAndRestart() = runBlocking {
         val fake = FakeAgent()
         val m = core(fake)
-        m.start(GenAdbConfig("ws://relay:7000/", audit = AuditMode.ON))
+        m.start(SetuConfig("ws://relay:7000/", audit = AuditMode.ON))
         val p = fake.awaitLaunch()
         assertEquals("10.0.0.53", fake.envs.take()["GENADB_DNS"])
         p.emit("""{"event":"pairing_code","code":"4321-QWERTY","device_id":"dev-9"}""")
@@ -190,7 +190,7 @@ class ManagerCoreTest {
     fun soloAuditOffByDefault() = runBlocking {
         val fake = FakeAgent()
         val m = core(fake)
-        m.start(GenAdbConfig("ws://relay:7000/"))
+        m.start(SetuConfig("ws://relay:7000/"))
         fake.awaitLaunch().emit("""{"event":"online","device_id":"d"}""")
         withTimeout(5000) { m.connectionState.first { it is ConnectionState.Online } }
         m.stop()
@@ -203,7 +203,7 @@ class ManagerCoreTest {
     fun corporateBlockedAndNoPairing() = runBlocking {
         val fake = FakeAgent()
         val m = core(fake, ManagedPolicy(relayUrl = "wss://corp/", enrollmentToken = "E", policyJson = "{}", debuggingAllowed = false))
-        m.start(GenAdbConfig(""))
+        m.start(SetuConfig(""))
         val p = fake.awaitLaunch()
         p.emit("""{"event":"blocked","reason":"debugging_disallowed"}""")
         withTimeout(5000) { m.connectionState.first { it is ConnectionState.Blocked } }
@@ -261,7 +261,7 @@ class ManagerCoreTest {
             launcher = { _, _ -> throw IllegalStateException("exec failed") }, policyProvider = { ManagedPolicy() },
             network = { emptyList() }, stateDir = dir, scope = guarded, backoff = Backoff(50, 100),
         )
-        m.start(GenAdbConfig("ws://relay:7000/"))
+        m.start(SetuConfig("ws://relay:7000/"))
         withTimeout(5000) { m.connectionState.first { it is ConnectionState.Reconnecting } }
         m.stop()
         guarded.cancel()
@@ -271,5 +271,18 @@ class ManagerCoreTest {
     @Test
     fun notConfigured() {
         assertFailsWith<GenAdbException.NotConfigured> { core(FakeAgent()).start(null) }
+    }
+}
+
+/** v1.0.1 renamed GenAdbConfig to SetuConfig; code written against 1.0.0 must still compile and behave the same. */
+class RenameCompatTest {
+    @Suppress("DEPRECATION")
+    @Test
+    fun genAdbConfigStillWorks() {
+        val old: GenAdbConfig = GenAdbConfig(relayUrl = "wss://relay.example/", mode = Mode.SOLO)
+        val new: SetuConfig = old
+        assertEquals(SetuConfig(relayUrl = "wss://relay.example/"), new)
+        assertEquals(agentArgs(effective(new, ManagedPolicy()), "/s", null),
+            agentArgs(effective(old, ManagedPolicy()), "/s", null))
     }
 }

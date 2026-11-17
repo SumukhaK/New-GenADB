@@ -34,6 +34,13 @@ type WebhookSink struct {
 	drop   int
 	fail   int
 	closed bool
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// CloseTimeout bounds how long Close waits for queued deliveries
+	// (default 5 s). Records still undelivered then are counted as failed;
+	// the local FileSink keeps the complete record.
+	CloseTimeout time.Duration
 }
 
 // NewWebhookSink starts a sink. secret must be non-empty.
@@ -44,7 +51,9 @@ func NewWebhookSink(url string, secret []byte, client *http.Client) (*WebhookSin
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	s := &WebhookSink{URL: url, secret: append([]byte(nil), secret...), client: client, q: make(chan []byte, 1024)}
+	s := &WebhookSink{URL: url, secret: append([]byte(nil), secret...), client: client, q: make(chan []byte, 1024),
+		CloseTimeout: 5 * time.Second}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.wg.Add(1)
 	go s.loop()
 	return s, nil
@@ -91,32 +100,38 @@ func (s *WebhookSink) loop() {
 	defer s.wg.Done()
 	for b := range s.q {
 		backoff := 500 * time.Millisecond
-		for attempt := 0; attempt < 5; attempt++ {
+		for attempt := 0; ; attempt++ {
 			if s.post(b) {
 				break
 			}
-			if attempt == 4 {
+			if attempt == 4 || s.ctx.Err() != nil {
 				s.mu.Lock()
 				s.fail++
 				s.mu.Unlock()
 				break
 			}
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+			case <-s.ctx.Done():
+			}
 			backoff *= 2
 		}
 	}
 }
 
 func (s *WebhookSink) post(b []byte) bool {
+	if s.ctx.Err() != nil {
+		return false
+	}
 	ts := time.Now().Unix()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, bytes.NewReader(b))
 	if err != nil {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "genadb-audit/1")
+	req.Header.Set("User-Agent", "setu-audit/1")
 	req.Header.Set("X-GenADB-Timestamp", strconv.FormatInt(ts, 10))
 	req.Header.Set("X-GenADB-Signature", Sign(s.secret, ts, b))
 	resp, err := s.client.Do(req)
@@ -135,7 +150,9 @@ func (s *WebhookSink) Stats() (dropped, failed int) {
 	return s.drop, s.fail
 }
 
-// Close stops accepting events and waits for queued deliveries to finish.
+// Close stops accepting events and waits up to CloseTimeout for queued
+// deliveries; after that it abandons them (counting them as failed) so that
+// shutdown never hangs on an unreachable collector.
 func (s *WebhookSink) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -145,6 +162,16 @@ func (s *WebhookSink) Close() error {
 	s.closed = true
 	close(s.q)
 	s.mu.Unlock()
-	s.wg.Wait()
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	t := time.NewTimer(s.CloseTimeout)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+		s.cancel() // in-flight posts and backoff sleeps return at once
+		<-done
+	}
+	s.cancel()
 	return nil
 }

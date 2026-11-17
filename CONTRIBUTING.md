@@ -1,4 +1,4 @@
-# Contributing to New-GenADB
+# Contributing to Setu (Setu-SDK)
 
 Thanks for your interest. Bug reports, fixes, documentation and new integrations are all welcome.
 
@@ -6,7 +6,7 @@ Thanks for your interest. Bug reports, fixes, documentation and new integrations
 
 - **Be kind.** Assume good intent and keep discussion about the work.
 - **Security issues are private.** Report vulnerabilities through GitHub's "Report a vulnerability" on this repository, never in a public issue or pull request.
-- **Licensing.** By contributing, you agree that your contribution is licensed under the Apache License 2.0 (see [LICENSE](LICENSE)). New dependencies must use a permissive licence (Apache-2.0, MIT, BSD or ISC). Copyleft licences such as GPL, LGPL and AGPL cannot be accepted. Test-only dependencies under EPL or MPL are acceptable.
+- **Licensing.** By contributing, you agree that your contribution is licensed under the Apache License 2.0 (see [LICENSE](LICENSE)). New dependencies must use a permissive licence (Apache-2.0, MIT, BSD or ISC), and a Go dependency must be added to `THIRD_PARTY_NOTICES.txt` (`go test ./internal/notices -update`; the test fails until you do). Copyleft licences such as GPL, LGPL and AGPL cannot be accepted. Test-only dependencies under EPL or MPL are acceptable.
 
 ## Development setup
 
@@ -25,6 +25,7 @@ go build ./cmd/...
 
 cd ..
 python3 eval.py           # must not regress (see below)
+python3 tests/repo_hygiene.py   # never commit compiled binaries
 
 cd android
 ./gradlew :agent-protocol:test
@@ -38,7 +39,7 @@ cd android
 | Public Go API | `core/pkg/genadb`, plus docs in `API_SPEC.md` |
 | Wire protocol, transport, tunnel, policy enforcement | `core/internal/engine`. Keep it unexported |
 | Audit records, reports, webhook | `core/pkg/genadb/audit` |
-| CLI commands | `core/cmd/genadb`; daemon methods in `core/internal/daemon` |
+| CLI commands | `core/internal/cli` (built as `setu` and `genadb`); daemon in `core/internal/daemon` |
 | Android public API | `android/genadb-android` (Android-specific) and `android/agent-protocol/src/main/kotlin/dev/genadb/sdk` (platform-neutral, JVM-tested) |
 
 The Kotlin SDK is compiled in explicit-API mode. Anything not meant for SDK users must be `internal` or `private`.

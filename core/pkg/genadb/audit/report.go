@@ -99,6 +99,9 @@ type Options struct {
 	Since, Until  time.Time // zero = unbounded
 	IncludeEvents bool      // embed the raw (filtered) events in JSON reports
 	Source        string    // free-text label, e.g. the log path
+	// Chain, when set, replaces the status Build computes with Verify, for
+	// example with VerifyFile's result, which also covers the anchor.
+	Chain *ChainStatus
 }
 
 func str(e Event, k string) string {
@@ -134,7 +137,12 @@ func num(e Event, k string) int64 {
 // Build summarises events. The chain is verified over the full log, before
 // any time filter is applied.
 func Build(events []Event, opt Options) Report {
-	r := Report{GeneratedAt: time.Now().UTC().Format(time.RFC3339), Source: opt.Source, Chain: Verify(events)}
+	r := Report{GeneratedAt: time.Now().UTC().Format(time.RFC3339), Source: opt.Source}
+	if opt.Chain != nil {
+		r.Chain = *opt.Chain
+	} else {
+		r.Chain = Verify(events)
+	}
 	if !opt.Since.IsZero() {
 		r.Since = opt.Since.UTC().Format(time.RFC3339)
 	}
@@ -338,7 +346,7 @@ th{font-weight:600;background:#f6f7f9}td.n{text-align:right;font-variant-numeric
 </style></head><body>
 <h1>GenADB audit report</h1>
 <div class="muted">Generated {{.GeneratedAt}}{{if .Source}} from {{.Source}}{{end}}{{if .FirstEvent}} · records {{.FirstEvent}} to {{.LastEvent}}{{end}}</div>
-<p>Integrity: {{if .Chain.Valid}}<span class="ok">hash chain intact</span> ({{.Chain.Records}} records){{else}}<span class="bad">hash chain BROKEN at record {{.Chain.BrokenAt}}: {{.Chain.Problem}}</span>{{end}}</p>
+<p>Integrity: {{if .Chain.Valid}}<span class="ok">hash chain intact</span> ({{.Chain.Records}} records{{if .Chain.Anchor}}, anchor {{.Chain.Anchor}}{{end}}){{range .Chain.Warnings}}<br><span class="bad">warning: {{.}}</span>{{end}}{{else}}<span class="bad">hash chain BROKEN at record {{.Chain.BrokenAt}}: {{.Chain.Problem}}</span>{{end}}</p>
 <div class="tiles">
 <div class="tile"><b>{{.Totals.Sessions}}</b>sessions</div>
 <div class="tile"><b>{{.Totals.Operations}}</b>adb operations</div>
