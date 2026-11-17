@@ -65,6 +65,7 @@ class MainActivity : ComponentActivity() {
                     st.warning?.let { Text(it) }
                 }
                 is ConnectionState.Blocked -> Text("Status: blocked by device policy (${st.reason})")
+                is ConnectionState.PolicyMissing -> Text("Status: waiting for device management (${st.missing} missing)")
                 is ConnectionState.Reconnecting -> Text("Status: reconnecting (attempt ${st.attempt}): ${st.reason ?: ""}")
                 ConnectionState.Starting -> Text("Status: starting")
                 ConnectionState.Idle -> Text("Status: stopped")

@@ -21,12 +21,19 @@ internal fun effective(cfg: GenAdbConfig, managed: ManagedPolicy): EffectiveConf
         else -> false
     }
     val isManaged = listOf(managed.relayUrl, managed.enrollmentToken, managed.policyJson).any { !it.isNullOrBlank() }
+    val policyJson = managed.policyJson?.takeIf { it.isNotBlank() } ?: cfg.policyJson?.takeIf { it.isNotBlank() }
+    val missing = when {
+        mode != Mode.CORPORATE -> null
+        enroll.isNullOrBlank() -> "enroll_token"
+        policyJson == null -> "policy_json"
+        else -> null
+    }
     return EffectiveConfig(
         config = cfg.copy(relayUrl = relay, mode = mode),
-        policy = PolicyStatus(mode, managed.debuggingAllowed, isManaged, audit),
+        policy = PolicyStatus(mode, managed.debuggingAllowed, isManaged, audit, missing),
         relayPin = managed.relayPin?.takeIf { it.isNotBlank() } ?: cfg.relayPin,
-        enrollmentToken = enroll,
-        policyJson = managed.policyJson?.takeIf { it.isNotBlank() } ?: cfg.policyJson,
+        enrollmentToken = enroll?.takeIf { it.isNotBlank() },
+        policyJson = policyJson,
     )
 }
 

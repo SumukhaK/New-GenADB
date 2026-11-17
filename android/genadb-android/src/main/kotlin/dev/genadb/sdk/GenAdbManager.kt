@@ -5,6 +5,7 @@ import android.content.RestrictionsManager
 import android.net.ConnectivityManager
 import android.net.wifi.WifiManager
 import android.os.UserManager
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -32,7 +33,7 @@ import java.io.File
 public class GenAdbManager private constructor(
     private val core: ManagerCore,
 ) {
-    /** Agent lifecycle: Idle, Starting, Online (with pairing code in solo mode), Reconnecting, Blocked. */
+    /** Agent lifecycle: Idle, Starting, Online (with pairing code in solo mode), Reconnecting, Blocked, PolicyMissing. */
     public val connectionState: StateFlow<ConnectionState> get() = core.connectionState
 
     /** Effective mode and device-management restrictions. */
@@ -44,7 +45,12 @@ public class GenAdbManager private constructor(
     /** The last 200 audit records of this process, oldest first. */
     public val recentAuditEvents: StateFlow<List<AuditEvent>> get() = core.recentAuditEvents
 
-    /** Starts (or restarts) the agent; [config] replaces the builder's configuration. */
+    /**
+     * Starts (or restarts) the agent; [config] replaces the builder's configuration.
+     * Incomplete corporate configuration does not throw: it sets
+     * [ConnectionState.PolicyMissing] and waits for the next start().
+     * @throws GenAdbException.NotConfigured when no relay URL is known
+     */
     public fun start(config: GenAdbConfig? = null) {
         core.start(config)
     }
@@ -53,6 +59,7 @@ public class GenAdbManager private constructor(
      * Starts the agent if needed and returns the pairing code a desktop uses
      * (`genadb connect --code …`). Solo mode only.
      * @throws GenAdbException.PairingUnavailable in corporate mode
+     * @throws GenAdbException.PolicyMissing when corporate configuration is incomplete
      * @throws GenAdbException.Blocked when debugging is disallowed
      * @throws GenAdbException.Timeout when the relay cannot be reached in time
      */
@@ -101,7 +108,9 @@ public class GenAdbManager private constructor(
                 policyProvider = policy ?: AndroidPolicyProvider(app),
                 network = network ?: AndroidNetworkInfo(app),
                 stateDir = dir,
-                scope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO),
+                scope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, t ->
+                    android.util.Log.e("GenAdb", "agent supervisor failed", t) // never crash the host app
+                }),
                 auditSinkOverride = audit,
                 onRunning = lock::set,
             )

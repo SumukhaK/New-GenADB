@@ -60,6 +60,14 @@ public sealed interface ConnectionState {
 
     /** Device management forbids debugging; the agent will not tunnel. */
     public data class Blocked(val reason: String) : ConnectionState
+
+    /**
+     * Corporate mode is configured but incomplete (for example the EMM pushed
+     * the enrollment token before the policy). The agent is not started;
+     * call start() again once managed configuration changes.
+     * [missing] names what is absent: "policy_json" or "enroll_token".
+     */
+    public data class PolicyMissing(val missing: String) : ConnectionState
 }
 
 /** Effective policy after merging the app config with device management. */
@@ -70,6 +78,8 @@ public data class PolicyStatus(
     /** True when relay / enrollment / policy came from device management. */
     val managed: Boolean = false,
     val auditEnabled: Boolean = false,
+    /** Corporate configuration item that is missing ("policy_json", "enroll_token"), or null. */
+    val missing: String? = null,
 )
 
 /** One sealed record of the device-side audit log. */
@@ -77,7 +87,7 @@ public data class AuditEvent(
     val seq: Long,
     /** RFC 3339 UTC. */
     val timestamp: String,
-    /** agent_start, pairing_code_issued, online, adbd_endpoint, adbd_unreachable, blocked, agent_error, agent_exit, agent_stop. */
+    /** agent_start, pairing_code_issued, online, adbd_endpoint, adbd_unreachable, blocked, policy_missing, agent_error, agent_exit, agent_stop. */
     val type: String,
     val deviceId: String?,
     /** Extra fields (never secrets, tokens or pairing codes). */
@@ -101,5 +111,6 @@ public sealed class GenAdbException(message: String) : Exception(message) {
     public class NotConfigured : GenAdbException("start() needs a GenAdbConfig with a relay URL")
     public class Blocked(public val reason: String) : GenAdbException("debugging is disallowed by device policy: $reason")
     public class PairingUnavailable : GenAdbException("pairing codes exist only in solo mode")
+    public class PolicyMissing(public val missing: String) : GenAdbException("corporate configuration incomplete: $missing is missing")
     public class Timeout(what: String) : GenAdbException("timed out waiting for $what")
 }

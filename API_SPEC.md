@@ -266,7 +266,7 @@ Common optional fields are `role` (`relay`, `desktop` or `device`), `user` (toke
 | `session_end` | desktop, relay | `transport`, `bytes_up`, `bytes_down`, `duration_ms`, `reason` |
 | `adb_op` | desktop | `op`, `path?`, `command?`, `sha256?`, `bytes_up`, `bytes_down`, `duration_ms`, `result?` (`failed`) |
 | `session_denied`, `revoked`, other relay events | relay | `reason` |
-| `agent_start`, `online`, `pairing_code_issued`, `adbd_endpoint`, `adbd_unreachable`, `blocked`, `agent_error`, `agent_exit`, `agent_stop` | device (Android SDK) | `mode`, `transport`, `reason`, `addr`, `exit_code` |
+| `agent_start`, `online`, `pairing_code_issued`, `adbd_endpoint`, `adbd_unreachable`, `blocked`, `policy_missing`, `agent_error`, `agent_exit`, `agent_stop` | device (Android SDK) | `mode`, `transport`, `reason`, `addr`, `exit_code`, `missing` |
 
 `op` values:
 
@@ -364,7 +364,9 @@ class GenAdbManager {
 }
 ```
 
-`pair()` can throw `GenAdbException.PairingUnavailable` (corporate mode), `GenAdbException.Blocked` or `GenAdbException.Timeout`.
+`pair()` can throw `GenAdbException.PairingUnavailable` (corporate mode), `GenAdbException.PolicyMissing`, `GenAdbException.Blocked` or `GenAdbException.Timeout`.
+
+Corporate configuration that is incomplete (an enrollment token without a policy, or the reverse) never throws from `start()` and never launches the agent. The state becomes `ConnectionState.PolicyMissing(missing)`, `policyStatus.missing` names the absent item, and a `policy_missing` audit record is written. Call `start()` again on `ACTION_APPLICATION_RESTRICTIONS_CHANGED`. Errors inside the agent supervisor are reported as `Reconnecting`, never thrown into the host app.
 
 ### 4.2 Models
 
@@ -379,8 +381,9 @@ sealed interface ConnectionState {
     data class Online(deviceId, pairingCode: String?, adbdEndpoint: String?, warning: String?)
     data class Reconnecting(attempt: Int, reason: String?, retryInMs: Long)
     data class Blocked(reason: String)
+    data class PolicyMissing(missing: String)   // "policy_json" | "enroll_token"
 }
-data class PolicyStatus(mode, debuggingAllowed, managed, auditEnabled)
+data class PolicyStatus(mode, debuggingAllowed, managed, auditEnabled, missing: String?)
 data class AuditEvent(seq, timestamp, type, deviceId, fields: Map<String,String>, eventHash, prevEventHash)
 data class GenAdbStatus(connection, policy, running, auditLogPath)
 enum class Mode { SOLO, CORPORATE };  enum class AuditMode { AUTO, ON, OFF }

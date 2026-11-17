@@ -38,8 +38,12 @@ class AgentService : Service() {
     private val genadb by lazy { GenAdbManager.getInstance(this) }
     private val restrictionsChanged = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
-            genadb.refreshPolicy()
-            genadb.start() // re-read managed relay / enrollment
+            // Re-read managed relay / enrollment / policy. Never let a bad
+            // EMM payload crash the app: the state flow reports what is wrong.
+            runCatching {
+                genadb.refreshPolicy()
+                genadb.start()
+            }.onFailure { notify("Not started: ${it.message}") }
         }
     }
 
@@ -66,6 +70,7 @@ class AgentService : Service() {
 
     private fun text(s: ConnectionState): String = when (s) {
         is ConnectionState.Blocked -> "Blocked by device policy"
+        is ConnectionState.PolicyMissing -> "Waiting for device management (${s.missing} missing)"
         is ConnectionState.Online -> s.pairingCode?.let { "Online · pairing code $it" } ?: "Online"
         is ConnectionState.Reconnecting -> s.reason ?: "Reconnecting…"
         ConnectionState.Starting -> "Starting…"

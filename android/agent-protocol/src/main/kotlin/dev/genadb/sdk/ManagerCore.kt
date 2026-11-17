@@ -1,5 +1,6 @@
 package dev.genadb.sdk
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -62,21 +63,40 @@ internal class ManagerCore(
     fun start(cfg: GenAdbConfig?) {
         synchronized(lock) {
             if (cfg != null) config = cfg
-            val c = config ?: throw GenAdbException.NotConfigured()
+            // Managed configuration alone (relay from EMM) is enough to start.
+            val c = config ?: GenAdbConfig(relayUrl = "")
             val eff = effective(c, policyProvider.current())
             if (eff.config.relayUrl.isBlank()) throw GenAdbException.NotConfigured()
             stopLocked(record = false)
             _policy.value = eff.policy
             audit = if (eff.policy.auditEnabled) auditSinkOverride ?: HashChainedAuditLog(auditFile) else null
+            eff.policy.missing?.let { missing ->
+                // Restrictive default: never launch a half-configured corporate agent.
+                recordAudit("policy_missing", mapOf("missing" to missing))
+                _connection.value = ConnectionState.PolicyMissing(missing)
+                return
+            }
             _connection.value = ConnectionState.Starting
             onRunning(true)
-            job = scope.launch(io) { supervise(eff) }
+            job = scope.launch(io) {
+                try {
+                    supervise(eff)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // Never let a configuration or I/O error escape into the
+                    // host app's coroutine scope (on Android that kills the process).
+                    recordAudit("agent_error", mapOf("reason" to (e.message ?: e.javaClass.simpleName)))
+                    if (currentJobActive()) _connection.value = ConnectionState.Reconnecting(0, e.message, -1)
+                }
+            }
         }
     }
 
     fun stop() = synchronized(lock) { stopLocked(record = true) }
 
     private fun stopLocked(record: Boolean) {
+        if (_connection.value is ConnectionState.PolicyMissing) _connection.value = ConnectionState.Idle
         val j = job ?: return
         job = null
         j.cancel()
@@ -100,6 +120,7 @@ internal class ManagerCore(
 
     suspend fun pair(timeoutMs: Long): String {
         if (!isRunning()) start(null)
+        (connectionState.value as? ConnectionState.PolicyMissing)?.let { throw GenAdbException.PolicyMissing(it.missing) }
         if (_policy.value.mode == Mode.CORPORATE) throw GenAdbException.PairingUnavailable()
         val s = withTimeoutOrNull(timeoutMs) {
             connectionState.first { it is ConnectionState.Blocked || (it is ConnectionState.Online && it.pairingCode != null) }

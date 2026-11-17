@@ -214,6 +214,60 @@ class ManagerCoreTest {
         m.stop()
     }
 
+    // Regression: an EMM that pushes the enrollment token before the policy
+    // must give a clean PolicyMissing state, never an exception that kills
+    // the app, and the agent must not be launched half-configured.
+    @Test
+    fun corporateTokenWithoutPolicyIsPolicyMissing() = runBlocking {
+        val fake = FakeAgent()
+        var managed = ManagedPolicy(relayUrl = "wss://corp/", enrollmentToken = "ENROLL", policyJson = null)
+        val m = ManagerCore(
+            launcher = fake, policyProvider = { managed }, network = { emptyList() }, stateDir = dir,
+            scope = scope, backoff = Backoff(initialMs = 50, maxMs = 100),
+        )
+        m.start(null) // no app config at all: everything comes from EMM
+        assertEquals(ConnectionState.PolicyMissing("policy_json"), m.connectionState.value)
+        assertEquals("policy_json", m.policyStatus.value.missing)
+        assertEquals(Mode.CORPORATE, m.policyStatus.value.mode)
+        assertFalse(m.isRunning())
+        assertNull(fake.launches.poll(200, TimeUnit.MILLISECONDS), "agent must not launch without a policy")
+        assertEquals("policy_missing", m.lastAuditEvent.value?.type, "corporate audit records the misconfiguration")
+        val e = assertFailsWith<GenAdbException.PolicyMissing> { m.pair(1000) }
+        assertEquals("policy_json", e.missing)
+
+        // Blank policy is the same as missing; so is a policy without a token.
+        managed = managed.copy(policyJson = "   ")
+        m.start(null)
+        assertIs<ConnectionState.PolicyMissing>(m.connectionState.value)
+        m.stop()
+        assertEquals(ConnectionState.Idle, m.connectionState.value)
+
+        // The policy arrives (EMM update): the agent starts normally.
+        managed = managed.copy(policyJson = """{"version":1}""")
+        m.start(null)
+        val args = fake.launches.poll(5, TimeUnit.SECONDS) ?: error("agent not launched")
+        assertTrue("--policy" in args && "ENROLL" in args)
+        assertTrue(File(dir, "policy.json").readText().contains("version"))
+        assertNull(m.policyStatus.value.missing)
+        m.stop()
+    }
+
+    @Test
+    fun agentArgsErrorsNeverEscapeTheScope() = runBlocking {
+        val crashed = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        val guarded = CoroutineScope(SupervisorJob() + Dispatchers.Default +
+            kotlinx.coroutines.CoroutineExceptionHandler { _, t -> crashed.set(t) })
+        val m = ManagerCore(
+            launcher = { _, _ -> throw IllegalStateException("exec failed") }, policyProvider = { ManagedPolicy() },
+            network = { emptyList() }, stateDir = dir, scope = guarded, backoff = Backoff(50, 100),
+        )
+        m.start(GenAdbConfig("ws://relay:7000/"))
+        withTimeout(5000) { m.connectionState.first { it is ConnectionState.Reconnecting } }
+        m.stop()
+        guarded.cancel()
+        assertNull(crashed.get())
+    }
+
     @Test
     fun notConfigured() {
         assertFailsWith<GenAdbException.NotConfigured> { core(FakeAgent()).start(null) }
