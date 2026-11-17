@@ -312,3 +312,25 @@ func Verify(events []Event) ChainStatus {
 }
 
 func errorf(format string, args ...any) error { return fmt.Errorf("audit: "+format, args...) }
+
+// Chained seals records with an in-memory chain (starting at genesis) before
+// forwarding them, for sinks that have no file behind them.
+func Chained(s Sink) Sink { return &chained{c: NewChain(0, ""), s: s} }
+
+type chained struct {
+	mu sync.Mutex
+	c  *Chain
+	s  Sink
+}
+
+func (c *chained) Write(e Event) error {
+	c.mu.Lock() // keep forwarding order equal to chain order
+	defer c.mu.Unlock()
+	sealed, err := c.c.Seal(e)
+	if err != nil {
+		return err
+	}
+	return c.s.Write(sealed)
+}
+
+func (c *chained) Close() error { return c.s.Close() }

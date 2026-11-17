@@ -68,8 +68,16 @@ func cliRelay(ctx context.Context, args []string) error {
 	fs.StringVar(&c.TLSCert, "tls-cert", "", "TLS certificate (PEM) for --ws-listen")
 	fs.StringVar(&c.TLSKey, "tls-key", "", "TLS private key (PEM) for --ws-listen")
 	fs.BoolVar(&c.TrustForwarded, "trust-forwarded", false, "take client IPs from CF-Connecting-IP / X-Forwarded-For on --ws-listen (only behind a reverse proxy or tunnel you control)")
+	wh := addWebhookFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	hook, err := wh.sink()
+	if err != nil {
+		return err
+	}
+	if hook != nil {
+		c.Audit = hook
 	}
 	c.Events = StdoutEvents
 	return RunRelay(ctx, c)
@@ -109,15 +117,20 @@ func cliConnect(ctx context.Context, args []string) error {
 	fs.StringVar(&c.Device, "device", "", "previously paired device id")
 	fs.StringVar(&c.Identity, "identity", "", "user identity JWT (corporate)")
 	fs.StringVar(&c.PolicyPath, "policy", "", "policy file (corporate)")
-	auditPath := fs.String("audit", "", "corporate: record sessions and adb operations to this hash-chained JSONL file")
+	auditPath := fs.String("audit", "", "record sessions and adb operations to this hash-chained JSONL file")
+	wh := addWebhookFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *auditPath != "" {
-		s, err := openAuditFile(*auditPath)
-		if err != nil {
-			return err
-		}
+	hook, err := wh.sink()
+	if err != nil {
+		return err
+	}
+	s, err := combineAudit(*auditPath, hook)
+	if err != nil {
+		return err
+	}
+	if s != nil {
 		defer s.Close()
 		c.Audit = s
 	}

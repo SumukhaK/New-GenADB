@@ -234,11 +234,13 @@ func classify(svc string) (kind, path, command string) {
 		name = name[:i]
 	}
 	first := func(s string) string {
-		f := strings.Fields(strings.ReplaceAll(s, "\x00", " "))
-		if len(f) == 0 {
-			return ""
+		// Skip leading VAR=value assignments: values are often credentials.
+		for _, w := range strings.Fields(strings.ReplaceAll(s, "\x00", " ")) {
+			if w = strings.Trim(w, `'"`); w != "" && !strings.Contains(w, "=") {
+				return w
+			}
 		}
-		return strings.Trim(f[0], `'"`)
+		return ""
 	}
 	lower := strings.ToLower(strings.ReplaceAll(rest, "\x00", " "))
 	isInstall := strings.Contains(lower, "package") && strings.Contains(lower, "install") ||
@@ -317,13 +319,22 @@ func (s *syncTracker) host(p []byte) {
 	s.hbuf = append(s.hbuf, p...)
 	for {
 		if s.pendingV2 != 0 {
-			if len(s.hbuf) < 12 {
+			// send_v2_setup is {id, mode, flags}; recv_v2_setup is {id, flags}.
+			size := 12
+			if s.pendingV2 == 'R' {
+				size = 8
+			}
+			if len(s.hbuf) < size {
 				return
 			}
-			if flags := u32(s.hbuf[8:]); flags != 0 && s.cur != nil {
-				s.cur.compressed = true
+			if flags := u32(s.hbuf[size-4:]); flags != 0 {
+				if s.pendingV2 == 'S' && s.cur != nil {
+					s.cur.compressed = true
+				} else if s.pendingV2 == 'R' && len(s.recvs) > 0 {
+					s.recvs[len(s.recvs)-1].compressed = true
+				}
 			}
-			s.hbuf, s.pendingV2 = s.hbuf[12:], 0
+			s.hbuf, s.pendingV2 = s.hbuf[size:], 0
 			continue
 		}
 		if len(s.hbuf) < 8 {
@@ -454,9 +465,6 @@ func (s *syncTracker) device(p []byte) {
 			t := s.recvs[0]
 			if t.start.IsZero() {
 				t.start = time.Now()
-				if s.pendingV2 == 'R' {
-					t.compressed = true // conservatively: v2 recv may be compressed
-				}
 			}
 			id, n := id4(s.dbuf), int(u32(s.dbuf[4:]))
 			switch id {

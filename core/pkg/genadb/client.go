@@ -123,7 +123,7 @@ func (c *Client) openAudit() error {
 type eventTap struct{ c *Client }
 
 func (t eventTap) Write(e audit.Event) error {
-	t.c.emit(Event{Type: EventAudit, Session: fmt.Sprint(e["session"]), Fields: e})
+	t.c.emit(Event{Type: EventAudit, Fields: e})
 	return nil
 }
 func (eventTap) Close() error { return nil }

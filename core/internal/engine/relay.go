@@ -112,20 +112,23 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		}
 		r.corporate, r.pol = true, p
 	}
-	var sinks audit.MultiSink
-	if cfg.AuditPath != "" {
+	// The file seals each record (seq + hash chain) and then tees the sealed
+	// record to any extra sink, so webhooks see exactly what the file holds.
+	switch {
+	case cfg.AuditPath != "":
 		f, err := audit.OpenFile(cfg.AuditPath, true)
 		if err != nil {
 			return err
 		}
-		sinks = append(sinks, f)
+		if cfg.Audit != nil {
+			f.Tee(cfg.Audit)
+		}
+		r.audit = f
+	case cfg.Audit != nil:
+		r.audit = audit.Chained(cfg.Audit)
 	}
-	if cfg.Audit != nil {
-		sinks = append(sinks, cfg.Audit)
-	}
-	if len(sinks) > 0 {
-		r.audit = sinks
-		defer sinks.Close()
+	if r.audit != nil {
+		defer r.audit.Close()
 	}
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
