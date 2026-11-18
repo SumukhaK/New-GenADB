@@ -20,3 +20,9 @@ func lockFile(f *os.File) error {
 }
 
 func unlockFile(f *os.File) error { return syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }
+
+// openShared opens a log or anchor file. On Unix an open file never stops
+// another process from renaming or deleting it, so this is os.OpenFile.
+func openShared(path string, flag int) (*os.File, error) { return os.OpenFile(path, flag, 0o600) }
+
+func renameFile(from, to string) error { return os.Rename(from, to) }

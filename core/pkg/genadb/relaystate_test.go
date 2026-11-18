@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -65,7 +66,10 @@ func TestRevocationsSurviveRelayRestart(t *testing.T) {
 	if err != nil || json.Unmarshal(b, &f) != nil || len(f.Users) != 1 || f.Users[0] != "alice" {
 		t.Fatalf("revocations.json = %s %v", b, err)
 	}
-	if st, _ := os.Stat(filepath.Join(state, "revocations.json")); st.Mode().Perm() != 0o600 {
+	// Windows reports no POSIX mode bits (0666), so 0600 is checked on Unix only.
+	if st, err := os.Stat(filepath.Join(state, "revocations.json")); err != nil {
+		t.Fatal(err)
+	} else if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("revocations.json mode %v", st.Mode())
 	}
 

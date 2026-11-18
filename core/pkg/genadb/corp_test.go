@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,8 +166,12 @@ func (w *corpWorld) startDevice(t *testing.T) {
 	}
 	dctx, dcancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	w.stopDevice = func() { dcancel(); <-done; dev.Close() }
-	t.Cleanup(func() { dcancel() })
+	var stopOnce sync.Once
+	// Stop the agent and close its audit log before the state directory is
+	// removed: Windows cannot delete a file that is still open.
+	stop := func() { stopOnce.Do(func() { dcancel(); <-done; dev.Close() }) }
+	w.stopDevice = stop
+	t.Cleanup(stop)
 	go func() {
 		defer close(done)
 		dev.HostDevice(dctx, genadb.HostConfig{ADBD: fakeADBD(t), EnrollmentToken: enroll})

@@ -1,0 +1,39 @@
+# Line endings: LF in the repository and in every checkout, whatever the
+# local core.autocrlf says. Windows is a primary target (Setu-Desktop), and
+# several tests compare repository files byte for byte (API_SPEC.md against
+# the report schema, THIRD_PARTY_NOTICES.txt against the generator), which a
+# CRLF checkout would break.
+* text=auto eol=lf
+
+*.go         text eol=lf
+*.mod        text eol=lf
+*.sum        text eol=lf
+*.kt         text eol=lf
+*.kts        text eol=lf
+*.py         text eol=lf
+*.md         text eol=lf
+*.txt        text eol=lf
+*.tsv        text eol=lf
+*.json       text eol=lf
+*.jsonl      text eol=lf
+*.xml        text eol=lf
+*.svg        text eol=lf
+*.properties text eol=lf
+*.pro        text eol=lf
+*.sh         text eol=lf
+LICENSE      text eol=lf
+NOTICE       text eol=lf
+android/gradlew text eol=lf
+
+# Windows batch files must stay CRLF for cmd.exe.
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+
+# Binaries: never touch.
+*.jar  binary
+*.png  binary
+*.jpg  binary
+*.webp binary
+*.so   binary
+*.aar  binary
+*.apk  binary

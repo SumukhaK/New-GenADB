@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -127,7 +128,7 @@ func (a *Anchor) Valid(key []byte) bool {
 
 // ReadAnchor reads an anchor file; it returns (nil, nil) if there is none.
 func ReadAnchor(path string) (*Anchor, error) {
-	b, err := os.ReadFile(path)
+	b, err := readShared(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -165,7 +166,7 @@ func writeAnchor(path string, a *Anchor, key []byte, syncFile bool) error {
 		err = os.Chmod(tmp.Name(), 0o600)
 	}
 	if err == nil {
-		err = os.Rename(tmp.Name(), path)
+		err = renameFile(tmp.Name(), path)
 	}
 	if err != nil {
 		os.Remove(tmp.Name())
@@ -206,7 +207,7 @@ func (l *linkScanner) add(seq int64, prev, hash string) {
 // hash of the record with seq == want.
 func scanLog(path string, want int64) (logInfo, error) {
 	ls := linkScanner{want: want}
-	f, err := os.Open(path)
+	f, err := openShared(path, os.O_RDONLY)
 	if errors.Is(err, fs.ErrNotExist) {
 		return ls.info, nil
 	}
@@ -377,7 +378,23 @@ func RotateFile(path, archive string, opt FileOptions) error {
 	if err := lockFile(s.f); err != nil {
 		return err
 	}
-	defer unlockFile(s.f)
+	// The write lock is held until the new log and its anchor exist, so a
+	// writer waiting on it never sees the gap between the renames. Writers
+	// in other processes that still hold the archived file reopen the new
+	// one on their next record (FileSink.catchUp).
+	err = s.rotateLocked(path, archive)
+	unlockFile(s.f)
+	// Release our own handle on the archived log explicitly, so nothing in
+	// this process keeps it open after RotateFile returns (on Windows an
+	// open handle would block moving or deleting the archive).
+	if cerr := s.f.Close(); err == nil && cerr != nil {
+		err = cerr
+	}
+	s.f = nil
+	return err
+}
+
+func (s *FileSink) rotateLocked(path, archive string) error {
 	if err := s.refresh(); err != nil {
 		return err
 	}
@@ -385,17 +402,28 @@ func RotateFile(path, archive string, opt FileOptions) error {
 		return fmt.Errorf("audit: rotate: %s already exists", archive)
 	}
 	last := *s.anchor
-	if err := os.Rename(path, archive); err != nil {
+	if err := renameFile(path, archive); err != nil {
 		return err
 	}
-	if err := os.Rename(s.anchorPath, AnchorPath(archive)); err != nil {
+	if err := renameFile(s.anchorPath, AnchorPath(archive)); err != nil {
 		return err
 	}
-	nf, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	nf, err := openShared(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
 	if err != nil {
 		return err
 	}
 	nf.Close()
 	next := &Anchor{FirstPrevHash: last.LastHash, LastSeq: last.LastSeq, LastHash: last.LastHash}
 	return writeAnchor(s.anchorPath, next, s.key, true)
+}
+
+// readShared is os.ReadFile through openShared, so reading an anchor never
+// blocks a writer from replacing it on Windows.
+func readShared(path string) ([]byte, error) {
+	f, err := openShared(path, os.O_RDONLY)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
 }

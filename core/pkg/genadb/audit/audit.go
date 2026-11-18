@@ -194,7 +194,7 @@ func OpenFileWith(path string, opt FileOptions) (*FileSink, error) {
 
 // open opens s.path and loads its state under the file lock.
 func (s *FileSink) open() error {
-	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o600)
+	f, err := openShared(s.path, os.O_CREATE|os.O_APPEND|os.O_RDWR)
 	if err != nil {
 		return err
 	}
@@ -231,6 +231,9 @@ func (s *FileSink) refresh() error {
 			return err
 		}
 		if last[0] != '\n' {
+			if _, err := s.f.Seek(0, io.SeekEnd); err != nil {
+				return err
+			}
 			if _, err := s.f.Write([]byte{'\n'}); err != nil {
 				return err
 			}
@@ -307,6 +310,9 @@ func (s *FileSink) catchUp() (rotated bool, err error) {
 func (s *FileSink) Write(e Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.f == nil {
+		return errorf("write to closed log %s", s.path)
+	}
 	for tries := 0; ; tries++ {
 		if err := lockFile(s.f); err != nil {
 			return err
@@ -335,6 +341,11 @@ func (s *FileSink) Write(e Event) error {
 	if err != nil {
 		return err
 	}
+	// O_APPEND already does this on Unix; Windows handles are opened
+	// without it (see openShared), and the lock makes the seek safe.
+	if _, err := s.f.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
 	n, err := s.f.Write(append(b, '\n'))
 	s.size += int64(n)
 	if err != nil {
@@ -361,10 +372,14 @@ func (s *FileSink) Write(e Event) error {
 	return nil
 }
 
-// Close closes the file and every tee.
+// Close closes the file and every tee. It is safe to call more than once.
 func (s *FileSink) Close() error {
 	s.mu.Lock()
-	err := s.f.Close()
+	var err error
+	if s.f != nil {
+		err = s.f.Close()
+		s.f = nil
+	}
 	s.mu.Unlock()
 	for _, t := range s.tees {
 		t.Close()
@@ -427,7 +442,7 @@ func Read(r io.Reader) ([]Event, error) {
 
 // ReadFile reads a JSONL audit log from disk.
 func ReadFile(path string) ([]Event, error) {
-	f, err := os.Open(path)
+	f, err := openShared(path, os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
