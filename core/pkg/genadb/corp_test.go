@@ -24,6 +24,7 @@ var b64 = base64.RawURLEncoding
 type corpWorld struct {
 	relay, admin, adminToken string
 	policyPath, stateDir     string
+	devicePolicy             string
 	relayID, deviceID        string
 	idp                      ed25519.PrivateKey
 	deviceEvents             chan genadb.Event
@@ -36,6 +37,7 @@ type corpOpts struct {
 	maxSessionSeconds int
 	grants            map[string][]string
 	relayState        string // persisted revocations live here ("" = temp)
+	deviceMaxSession  int    // >0: the device's policy has this cap (relay and desktop keep maxSessionSeconds)
 }
 
 func freeAddr(t *testing.T) string {
@@ -79,6 +81,13 @@ func startCorp(t *testing.T, o corpOpts) *corpWorld {
 	pb, _ := json.Marshal(pol)
 	w.policyPath = filepath.Join(dir, "policy.json")
 	os.WriteFile(w.policyPath, pb, 0o644)
+	w.devicePolicy = w.policyPath
+	if o.deviceMaxSession > 0 {
+		pol["max_session_seconds"] = o.deviceMaxSession
+		db, _ := json.Marshal(pol)
+		w.devicePolicy = filepath.Join(dir, "device-policy.json")
+		os.WriteFile(w.devicePolicy, db, 0o644)
+	}
 
 	w.admin = freeAddr(t)
 	rs := o.relayState
@@ -139,7 +148,7 @@ func (w *corpWorld) startDevice(t *testing.T) {
 	enroll := w.mint(w.deviceID, "device", dpub, time.Hour)
 	online := make(chan struct{}, 1)
 	dev, err := genadb.New(genadb.WithRelayURL(w.relay), genadb.WithStateDir(devState),
-		genadb.WithCorporateToken(enroll, w.policyPath), genadb.WithEventHandler(func(e genadb.Event) {
+		genadb.WithCorporateToken(enroll, w.devicePolicy), genadb.WithEventHandler(func(e genadb.Event) {
 			if e.Type == "online" {
 				select {
 				case online <- struct{}{}:

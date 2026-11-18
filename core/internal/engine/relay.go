@@ -93,6 +93,7 @@ type relay struct {
 	pendingBy      map[string]int // device id -> session opens awaiting the device
 	trustForwarded bool
 	revFile        string     // persisted revocations ("" = memory only)
+	policyPath     string
 	persistMu      sync.Mutex // serialises writes of revFile
 }
 
@@ -152,7 +153,7 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		if err != nil {
 			return err
 		}
-		r.corporate, r.pol = true, p
+		r.corporate, r.pol, r.policyPath = true, p, cfg.PolicyPath
 	}
 	// The file seals each record (seq + hash chain) and then tees the sealed
 	// record to any extra sink, so webhooks see exactly what the file holds.
@@ -353,6 +354,29 @@ func (r *relay) adminHandler(token string) http.Handler {
 		sort.Strings(users)
 		sort.Strings(devices)
 		reply(w, map[string]any{"users": users, "devices": devices})
+	})
+	mux.HandleFunc("/v1/policy", func(w http.ResponseWriter, req *http.Request) {
+		// GET /v1/policy?device=<id>: the policy to push to that one device
+		// through MDM (its own grants only).
+		if !authed(w, req, http.MethodGet) {
+			return
+		}
+		if r.policyPath == "" {
+			http.Error(w, "no policy (solo relay)", http.StatusNotFound)
+			return
+		}
+		raw, err := os.ReadFile(r.policyPath)
+		if err != nil {
+			http.Error(w, "policy unreadable", http.StatusInternalServerError)
+			return
+		}
+		out, err := ScopePolicy(raw, req.URL.Query().Get("device"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(append(out, '\n'))
 	})
 	mux.HandleFunc("/v1/devices", func(w http.ResponseWriter, req *http.Request) {
 		if !authed(w, req, http.MethodGet) {

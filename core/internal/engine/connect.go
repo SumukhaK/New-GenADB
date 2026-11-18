@@ -36,6 +36,8 @@ type desktopAgent struct {
 
 	mu      sync.Mutex
 	tunnels map[*tunnel]struct{}
+	ln      net.Listener
+	termErr error
 }
 
 // EventFunc receives machine-readable agent events ("listening",
@@ -113,11 +115,25 @@ func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
 	if err != nil {
 		return err
 	}
+	a.mu.Lock()
+	a.ln = ln
+	a.mu.Unlock()
 	stop := context.AfterFunc(ctx, func() {
 		ln.Close()
 		a.closeAll("")
 	})
 	defer stop()
+	if a.pol != nil && a.pol.MaxSessionSeconds > 0 {
+		// The corporate hard cap ends the whole session, however often its
+		// paths were rejoined; continuing needs a new Connect, which
+		// re-authenticates. The device enforces the same cap on its side.
+		limit := time.Duration(a.pol.MaxSessionSeconds) * time.Second
+		tm := time.AfterFunc(limit, func() {
+			a.terminate(fmt.Errorf("%w: %w (%ds); connect again to re-authenticate", errDenied, ErrSessionExpired, a.pol.MaxSessionSeconds),
+				"session_expired")
+		})
+		defer tm.Stop()
+	}
 	cfg.Events("listening", map[string]any{"addr": ln.Addr().String(), "device_id": id})
 	for {
 		conn, err := ln.Accept()
@@ -125,10 +141,40 @@ func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			if t := a.terminated(); t != nil {
+				return t
+			}
 			return err
 		}
 		go a.serveADB(conn, id, lan, params)
 	}
+}
+
+// terminate ends the whole session for good (hard cap reached, or the
+// device ended it): no more adb connections, every tunnel closed with
+// reason, and RunDesktop returns err. The first call wins.
+func (a *desktopAgent) terminate(err error, reason string) {
+	a.mu.Lock()
+	if a.termErr != nil {
+		a.mu.Unlock()
+		return
+	}
+	a.termErr = err
+	ln := a.ln
+	a.mu.Unlock()
+	logf("session ended: %v", err)
+	a.events(reason, map[string]any{"device_id": a.deviceID, "reason": reason})
+	a.record(audit.Event{"event": "session_terminated", "reason": reason})
+	if ln != nil {
+		ln.Close()
+	}
+	a.closeAll(reason)
+}
+
+func (a *desktopAgent) terminated() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.termErr
 }
 
 // newDesktop loads the identity and builds the handshake parameters shared
@@ -338,6 +384,14 @@ func (a *desktopAgent) serveADB(conn net.Conn, id, lan string, params initiatorP
 	a.mu.Lock()
 	delete(a.tunnels, t)
 	a.mu.Unlock()
+	switch why := t.PeerReason(); why {
+	case "":
+	case "session_expired":
+		// The device's clock reached the cap first: it is authoritative.
+		a.terminate(fmt.Errorf("%w: %w: ended by the device; connect again to re-authenticate", errDenied, ErrSessionExpired), why)
+	default:
+		a.terminate(fmt.Errorf("%w: %w: %s", errDenied, ErrPeerClosed, why), "peer_closed")
+	}
 	if obs != nil {
 		obs.finish()
 		up, down := obs.totals()

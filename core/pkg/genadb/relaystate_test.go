@@ -161,3 +161,21 @@ func TestAdminDevicesAndUserPresence(t *testing.T) {
 		t.Fatalf("solo presence: %v", err)
 	}
 }
+
+func TestAdminServesPerDevicePolicy(t *testing.T) {
+	w := startCorp(t, corpOpts{grants: map[string][]string{"alice": {"dev-A", "dev-B"}, "bob": {"dev-B"}}})
+	if code, _ := w.adminCall(t, "GET", "/v1/policy?device=dev-A", nil, false); code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated policy fetch: %d", code)
+	}
+	code, m := w.adminCall(t, "GET", "/v1/policy?device=dev-A", nil, true)
+	if code != 200 {
+		t.Fatalf("policy: %d", code)
+	}
+	g, _ := m["grants"].([]any)
+	if len(g) != 1 || g[0].(map[string]any)["user"] != "alice" || m["relay_id"] != w.relayID {
+		t.Fatalf("scoped policy %v", m)
+	}
+	if code, _ := w.adminCall(t, "GET", "/v1/policy", nil, true); code != http.StatusBadRequest {
+		t.Fatalf("policy without device: %d", code)
+	}
+}

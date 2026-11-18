@@ -61,6 +61,22 @@ func (p *policy) granted(user, device string) bool {
 	return false
 }
 
+// scopedTo drops every grant that does not name device (the device agent
+// keeps only what concerns it).
+func (p *policy) scopedTo(device string) {
+	kept := p.Grants[:0]
+	for _, g := range p.Grants {
+		for _, d := range g.Devices {
+			if d == device {
+				g.Devices = []string{device}
+				kept = append(kept, g)
+				break
+			}
+		}
+	}
+	p.Grants = kept
+}
+
 // devicesFor lists the devices granted to user, sorted and de-duplicated.
 func (p *policy) devicesFor(user string) []string {
 	seen := map[string]bool{}
@@ -191,4 +207,45 @@ func VerifyUserToken(policyPath, state, token string) (TokenInfo, error) {
 		return TokenInfo{}, deniedError("token: " + err.Error())
 	}
 	return TokenInfo{Subject: cl.Sub, TokenID: cl.Jti, Expires: time.Unix(cl.Exp, 0).UTC()}, nil
+}
+
+// ScopePolicy returns the organisation policy reduced to what one device
+// needs: the trust settings (relay id, issuer, IdP key, session cap) and
+// only the grants that name this device, each listing just this device.
+// Push this per device through MDM instead of the organisation's whole
+// user-to-device map. Unknown top-level fields are kept.
+func ScopePolicy(raw []byte, deviceID string) ([]byte, error) {
+	if deviceID == "" {
+		return nil, errors.New("policy scope: a device id is required")
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("policy scope: %w", err)
+	}
+	var grants []struct {
+		User    string   `json:"user"`
+		Devices []string `json:"devices"`
+	}
+	if g, ok := doc["grants"]; ok {
+		if err := json.Unmarshal(g, &grants); err != nil {
+			return nil, fmt.Errorf("policy scope: grants: %w", err)
+		}
+	}
+	type grant struct {
+		User    string   `json:"user"`
+		Devices []string `json:"devices"`
+	}
+	scoped := []grant{}
+	seen := map[string]bool{}
+	for _, g := range grants {
+		for _, d := range g.Devices {
+			if d == deviceID && !seen[g.User] {
+				seen[g.User] = true
+				scoped = append(scoped, grant{User: g.User, Devices: []string{deviceID}})
+			}
+		}
+	}
+	gb, _ := json.Marshal(scoped)
+	doc["grants"] = gb
+	return json.MarshalIndent(doc, "", "  ")
 }

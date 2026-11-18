@@ -114,6 +114,7 @@ func RunDevice(ctx context.Context, cfg DeviceConfig) error {
 		if d.pol, err = loadPolicy(cfg.PolicyPath); err != nil {
 			return err
 		}
+		d.pol.scopedTo(id) // the phone needs nothing about other devices
 		if _, err := d.pol.verifyToken(cfg.Enroll, "device", key.Public().(ed25519.PublicKey)); err != nil {
 			return fmt.Errorf("enrollment token: %w", err)
 		}
@@ -373,6 +374,17 @@ func (d *deviceAgent) serveStream(c net.Conn, transport string) {
 
 func (d *deviceAgent) runTunnel(t *tunnel, transport string) {
 	t.observe(transport, d.events)
+	if d.mode == "corporate" && d.pol != nil && d.pol.MaxSessionSeconds > 0 {
+		// Hard cap, enforced here because the device is the party that must
+		// not be talked into more: the tunnel is closed (and can no longer be
+		// rejoined) once it is max_session_seconds old, whatever the desktop
+		// does. A new stream needs a full, token-checked handshake.
+		tm := time.AfterFunc(time.Duration(d.pol.MaxSessionSeconds)*time.Second, func() {
+			logf("session %s reached max_session_seconds", t.ID())
+			t.closeWith("session_expired")
+		})
+		defer tm.Stop()
+	}
 	key := hex.EncodeToString(t.sid)
 	d.mu.Lock()
 	d.tunnels[key] = t
