@@ -72,6 +72,7 @@ internal sealed interface AgentEvent {
     data class AdbdEndpoint(val addr: String) : AgentEvent
     data class AdbdUnreachable(val reason: String) : AgentEvent
     data class Error(val reason: String) : AgentEvent
+    data class Path(val status: PathStatus) : AgentEvent
     data class Other(val name: String) : AgentEvent
 
     companion object {
@@ -84,6 +85,19 @@ internal sealed interface AgentEvent {
                 "adbd_endpoint" -> AdbdEndpoint(o.optString("addr"))
                 "adbd_unreachable" -> AdbdUnreachable(o.optString("reason"))
                 "error" -> Error(o.optString("reason"))
+                "path_down", "path_up", "path_lost" -> Path(
+                    PathStatus(
+                        sessionId = o.optString("session_id"),
+                        state = when (e) {
+                            "path_down" -> PathState.DOWN
+                            "path_up" -> PathState.UP
+                            else -> PathState.LOST
+                        },
+                        transport = o.optString("transport").takeIf { it.isNotEmpty() },
+                        reason = o.optString("reason").takeIf { it.isNotEmpty() },
+                        outageMs = if (o.has("outage_ms")) o.optLong("outage_ms") else null,
+                    ),
+                )
                 "" -> null
                 else -> Other(e)
             }
@@ -100,6 +114,7 @@ internal data class AgentView(
     val warning: String? = null,
     val blocked: String? = null,
     val lastError: String? = null,
+    val path: PathStatus? = null,
 ) {
     fun reduce(e: AgentEvent): AgentView = when (e) {
         is AgentEvent.Online -> copy(online = true, deviceId = e.deviceId, lastError = null)
@@ -108,12 +123,13 @@ internal data class AgentView(
         is AgentEvent.AdbdEndpoint -> copy(adbdEndpoint = e.addr, warning = null)
         is AgentEvent.AdbdUnreachable -> copy(warning = "Wireless debugging unreachable: ${e.reason}")
         is AgentEvent.Error -> copy(online = false, lastError = e.reason)
+        is AgentEvent.Path -> copy(path = e.status)
         is AgentEvent.Other -> this
     }
 
     fun state(): ConnectionState = when {
         blocked != null -> ConnectionState.Blocked(blocked)
-        online && deviceId != null -> ConnectionState.Online(deviceId, pairingCode, adbdEndpoint, warning)
+        online && deviceId != null -> ConnectionState.Online(deviceId, pairingCode, adbdEndpoint, warning, path)
         else -> ConnectionState.Starting
     }
 }
@@ -126,5 +142,11 @@ internal fun auditFor(e: AgentEvent): Pair<String, Map<String, String>>? = when 
     is AgentEvent.AdbdEndpoint -> "adbd_endpoint" to mapOf("addr" to e.addr)
     is AgentEvent.AdbdUnreachable -> "adbd_unreachable" to mapOf("reason" to e.reason)
     is AgentEvent.Error -> "agent_error" to mapOf("reason" to e.reason)
+    is AgentEvent.Path -> "path_" + e.status.state.name.lowercase() to buildMap {
+        put("session_id", e.status.sessionId)
+        e.status.transport?.let { put("transport", it) }
+        e.status.reason?.let { put("reason", it) }
+        e.status.outageMs?.let { put("outage_ms", it.toString()) }
+    }
     is AgentEvent.Other -> null
 }

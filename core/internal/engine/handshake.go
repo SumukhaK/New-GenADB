@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 
 	"crypto/ecdh"
 	"crypto/ed25519"
@@ -68,8 +69,10 @@ func hasCap(caps []string, c string) bool {
 
 // handshakeMeta travels sealed in M3.
 type handshakeMeta struct {
-	// Target is "" (adbd) or "adb-pair:<port>" (Android 11+ Wireless
-	// debugging pairing service; port 0 = discover it on the device).
+	// Target is "" (adbd), "probe" (authenticate only: pairing and the
+	// pre-listen reachability check, so the device opens no adbd stream) or
+	// "adb-pair:<port>" (Android 11+ Wireless debugging pairing service;
+	// port 0 = discover it on the device).
 	Target string `json:"target,omitempty"`
 	// Label is the desktop's display name for the phone's session list.
 	Label string `json:"label,omitempty"`
@@ -247,7 +250,7 @@ func clientHandshake(c net.Conn, r io.Reader, p initiatorParams) (*secureConn, e
 			return nil, nil, err
 		}
 	}
-	if p.target != "" && !hasCap(m2.Caps, capADBPair) {
+	if strings.HasPrefix(p.target, "adb-pair:") && !hasCap(m2.Caps, capADBPair) {
 		return nil, nil, fmt.Errorf("%w: %w: adb pairing needs Setu-SDK 1.1.0 or later on the device", errDenied, ErrUnsupported)
 	}
 	th2 := thash(th1, m2.Sig)

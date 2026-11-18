@@ -53,7 +53,7 @@ func (d *deviceAgent) serveLAN(ln net.Listener) {
 		if tc, ok := c.(*net.TCPConn); ok {
 			tc.SetNoDelay(true)
 		}
-		go d.serveStream(c)
+		go d.serveStream(c, "lan")
 	}
 }
 
@@ -297,14 +297,16 @@ func (d *deviceAgent) openData(sid string) {
 		c.Close()
 		return
 	}
-	d.serveStream(c)
+	d.serveStream(c, TransportLabel(d.relayAddr))
 }
 
 // handshakeSlots bounds concurrent unauthenticated handshakes so a flood of
 // session opens cannot exhaust the phone.
 var handshakeSlots = make(chan struct{}, 16)
 
-func (d *deviceAgent) serveStream(c net.Conn) {
+// serveStream authenticates one stream (transport: lan or a relay label)
+// and serves it: a new tunnel to adbd, an adb pairing stream, or a rejoin.
+func (d *deviceAgent) serveStream(c net.Conn, transport string) {
 	select {
 	case handshakeSlots <- struct{}{}:
 	default:
@@ -331,7 +333,7 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		var rj rejoinMsg
 		if json.Unmarshal(b1, &rj) != nil {
 			c.Close()
-		} else if err := serverRejoin(c, c, rj, d.lookupTunnel); err != nil {
+		} else if err := serverRejoin(c, c, rj, d.lookupTunnel, transport); err != nil {
 			logf("rejoin refused: %v", err)
 			c.Close()
 		}
@@ -343,9 +345,14 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		c.Close()
 		return
 	}
+	if hs.meta.Target == "probe" {
+		// The desktop only checked that we answer and trust it.
+		c.Close()
+		return
+	}
 	if strings.HasPrefix(hs.meta.Target, "adb-pair:") {
 		release()
-		d.servePairing(sc, hs)
+		d.servePairing(sc, hs, transport)
 		return
 	}
 	if hs.meta.Target != "" {
@@ -361,10 +368,11 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		return
 	}
 	release()
-	d.runTunnel(newTunnel(sc, accelerate(a), false))
+	d.runTunnel(newTunnel(sc, accelerate(a), false), transport)
 }
 
-func (d *deviceAgent) runTunnel(t *tunnel) {
+func (d *deviceAgent) runTunnel(t *tunnel, transport string) {
+	t.observe(transport, d.events)
 	key := hex.EncodeToString(t.sid)
 	d.mu.Lock()
 	d.tunnels[key] = t
@@ -380,7 +388,7 @@ func (d *deviceAgent) runTunnel(t *tunnel) {
 // pairing service on this phone. The pairing code itself never reaches us:
 // adb on the desktop and adbd run their own SPAKE2 exchange inside our
 // end-to-end encrypted tunnel.
-func (d *deviceAgent) servePairing(sc *secureConn, hs handshakeResult) {
+func (d *deviceAgent) servePairing(sc *secureConn, hs handshakeResult, transport string) {
 	port, err := strconv.Atoi(strings.TrimPrefix(hs.meta.Target, "adb-pair:"))
 	if err != nil || port < 0 || port > 65535 {
 		sc.Close()
@@ -395,7 +403,7 @@ func (d *deviceAgent) servePairing(sc *secureConn, hs handshakeResult) {
 		return
 	}
 	d.events("adb_pair_open", map[string]any{"addr": addr})
-	d.runTunnel(newTunnel(sc, pc, false))
+	d.runTunnel(newTunnel(sc, pc, false), transport)
 	d.events("adb_pair_closed", map[string]any{"addr": addr})
 }
 

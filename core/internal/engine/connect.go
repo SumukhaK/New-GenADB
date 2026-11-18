@@ -82,7 +82,7 @@ func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
 		if err != nil {
 			return err
 		}
-		_, peer, err := clientHandshake(c, br, initiatorParams{id: a.key, mode: "pair", secret: secret, nameplate: np})
+		_, peer, err := clientHandshake(c, br, initiatorParams{id: a.key, mode: "pair", secret: secret, nameplate: np, target: "probe"})
 		c.Close()
 		if err != nil {
 			return fmt.Errorf("%w: %w", errDenied, err)
@@ -102,7 +102,9 @@ func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
 		return err
 	}
 	lan := rep0.LAN
-	_, _, err = clientHandshake(c, br, params)
+	probe := params
+	probe.target = "probe"
+	_, _, err = clientHandshake(c, br, probe)
 	c.Close()
 	if err != nil {
 		return fmt.Errorf("%w: %v", errDenied, err)
@@ -275,7 +277,7 @@ func PairADB(ctx context.Context, cfg DesktopConfig, pairingPort int, pair func(
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				t.run(func(t *tunnel) error { return a.rejoin(cfg.Device, "", t) })
+				t.run(func(t *tunnel) (string, error) { return a.rejoin(cfg.Device, "", t) })
 				a.mu.Lock()
 				delete(a.tunnels, t)
 				a.mu.Unlock()
@@ -327,11 +329,12 @@ func (a *desktopAgent) serveADB(conn net.Conn, id, lan string, params initiatorP
 		a.record(audit.Event{"event": "session_start", "session": obs.session, "transport": path})
 	}
 	t := newTunnel(sc, accelerate(local), true)
+	t.observe(path, a.events)
 	a.mu.Lock()
 	a.tunnels[t] = struct{}{}
 	a.mu.Unlock()
 	started := time.Now()
-	t.run(func(t *tunnel) error { return a.rejoin(id, lan, t) })
+	t.run(func(t *tunnel) (string, error) { return a.rejoin(id, lan, t) })
 	a.mu.Lock()
 	delete(a.tunnels, t)
 	a.mu.Unlock()
@@ -464,25 +467,26 @@ func (a *desktopAgent) establish(id, lan string, params initiatorParams) (*secur
 	return sc, TransportLabel(a.relayAddr), nil
 }
 
-// rejoin re-attaches an existing tunnel after the underlying path broke.
-func (a *desktopAgent) rejoin(id, lan string, t *tunnel) error {
+// rejoin re-attaches an existing tunnel after the underlying path broke and
+// reports the transport it used (lan or a relay label).
+func (a *desktopAgent) rejoin(id, lan string, t *tunnel) (string, error) {
 	if lan != "" {
 		if dc, err := net.DialTimeout("tcp", lan, 700*time.Millisecond); err == nil {
 			if err := clientRejoin(dc, dc, t); err == nil {
-				return nil
+				return "lan", nil
 			}
 			dc.Close()
 		}
 	}
 	c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := clientRejoin(c, br, t); err != nil {
 		c.Close()
-		return err
+		return "", err
 	}
-	return nil
+	return TransportLabel(a.relayAddr), nil
 }
 
 func (a *desktopAgent) openSession(h hello) (net.Conn, *bufio.Reader, string, error) {
