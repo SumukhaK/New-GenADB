@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -27,6 +28,8 @@ type corpWorld struct {
 	idp                      ed25519.PrivateKey
 	deviceEvents             chan genadb.Event
 	stopDevice               context.CancelFunc
+	relayCfg                 engine.RelayConfig
+	stopRelay                func()
 }
 
 type corpOpts struct {
@@ -77,28 +80,53 @@ func startCorp(t *testing.T, o corpOpts) *corpWorld {
 	w.policyPath = filepath.Join(dir, "policy.json")
 	os.WriteFile(w.policyPath, pb, 0o644)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	ready := make(chan string, 1)
 	w.admin = freeAddr(t)
 	rs := o.relayState
 	if rs == "" {
 		rs = t.TempDir()
 	}
-	go engine.RunRelay(ctx, engine.RelayConfig{Listen: "127.0.0.1:0", Mode: "corporate", PolicyPath: w.policyPath,
-		AdminListen: w.admin, AdminToken: w.adminToken, StateDir: rs,
-		Events: func(ev string, f map[string]any) {
-			if ev == "ready" {
-				ready <- f["addr"].(string)
-			}
-		}})
-	select {
-	case w.relay = <-ready:
-	case <-time.After(5 * time.Second):
-		t.Fatal("relay did not start")
-	}
+	w.relayCfg = engine.RelayConfig{Listen: freeAddr(t), Mode: "corporate", PolicyPath: w.policyPath,
+		AdminListen: w.admin, AdminToken: w.adminToken, StateDir: rs}
+	w.startRelay(t)
 	w.startDevice(t)
 	return w
+}
+
+// startRelay (re)starts the relay on the same addresses and state.
+func (w *corpWorld) startRelay(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan string, 1)
+	done := make(chan error, 1)
+	cfg := w.relayCfg
+	cfg.Events = func(ev string, f map[string]any) {
+		if ev == "ready" {
+			ready <- f["addr"].(string)
+		}
+	}
+	go func() { done <- engine.RunRelay(ctx, cfg) }()
+	w.stopRelay = func() {
+		cancel()
+		<-done
+		time.Sleep(100 * time.Millisecond) // let the admin listener's port go
+	}
+	t.Cleanup(cancel)
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case w.relay = <-ready:
+			return
+		case err := <-done:
+			// the previous instance may still hold a port for a moment: retry
+			if err == nil || errors.Is(err, context.Canceled) {
+				t.Fatalf("relay stopped: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			go func() { done <- engine.RunRelay(ctx, cfg) }()
+		case <-deadline:
+			t.Fatal("relay did not start")
+		}
+	}
 }
 
 func (w *corpWorld) startDevice(t *testing.T) {

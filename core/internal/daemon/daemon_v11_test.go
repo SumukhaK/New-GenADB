@@ -231,3 +231,10 @@ func TestDaemonPrintsReadyLine(t *testing.T) {
 		t.Fatal("daemon did not stop")
 	}
 }
+
+func TestDaemonPresenceNeedsCorporateMode(t *testing.T) {
+	_, r := setup(t, "", genadb.WithRelayURL("127.0.0.1:1"))
+	if m := r.call("devices.presence", nil); errCode(m) != CodeDenied {
+		t.Fatalf("solo presence: %v", m)
+	}
+}

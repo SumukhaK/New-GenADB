@@ -473,6 +473,13 @@ func (s *Server) call(ctx context.Context, c *conn, req request) (any, error) {
 		}
 		return map[string]any{"devices": d}, err
 
+	case "devices.presence":
+		d, err := cl.Presence(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"devices": d}, nil
+
 	case "devices.forget":
 		var p struct {
 			DeviceID string `json:"device_id"`

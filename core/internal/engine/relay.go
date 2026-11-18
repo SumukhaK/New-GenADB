@@ -11,9 +11,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/sumukhak/new-genadb/core/pkg/genadb/audit"
+	"io/fs"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,13 +43,28 @@ type reply struct {
 	Open      string `json:"open,omitempty"`
 	Challenge []byte `json:"challenge,omitempty"`
 	LAN       string `json:"lan,omitempty"`
+	// Devices answers a "presence" hello (v1.1.0+, corporate).
+	Devices []DevicePresence `json:"devices,omitempty"`
+}
+
+// DevicePresence is one device in a presence answer or the admin
+// GET /v1/devices listing.
+type DevicePresence struct {
+	DeviceID    string     `json:"device_id"`
+	Online      bool       `json:"online"`
+	ConnectedAt *time.Time `json:"connected_at,omitempty"`
+	Transport   string     `json:"transport,omitempty"` // how the device reaches the relay: tcp | ws | wss
+	Sessions    int        `json:"sessions"`            // relayed sessions open to it now
+	Revoked     bool       `json:"revoked,omitempty"`   // admin listing only
 }
 
 type deviceEntry struct {
-	conn net.Conn
-	code string
-	lan  string
-	wmu  sync.Mutex
+	conn      net.Conn
+	code      string
+	lan       string
+	since     time.Time
+	transport string
+	wmu       sync.Mutex
 }
 
 type session struct {
@@ -71,6 +92,8 @@ type relay struct {
 	limits         *limiter
 	pendingBy      map[string]int // device id -> session opens awaiting the device
 	trustForwarded bool
+	revFile        string     // persisted revocations ("" = memory only)
+	persistMu      sync.Mutex // serialises writes of revFile
 }
 
 const maxPendingPerDevice = 16
@@ -109,6 +132,21 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		pendR: map[string]*bufio.Reader{}, sessions: map[string]*session{}, revoked: map[string]bool{},
 		limits: newLimiter(), pendingBy: map[string]int{}}
 	r.trustForwarded = cfg.TrustForwarded
+	if cfg.StateDir != "" {
+		r.revFile = filepath.Join(cfg.StateDir, "revocations.json")
+		rev, err := loadRevocations(r.revFile)
+		if err != nil {
+			// Fail closed: starting with an unreadable list would quietly
+			// un-revoke every revoked user and device.
+			return fmt.Errorf("revocations: %w", err)
+		}
+		for k := range rev {
+			r.revoked[k] = true
+		}
+		if len(rev) > 0 {
+			logf("loaded %d revocations from %s", len(rev), r.revFile)
+		}
+	}
 	if cfg.Mode == "corporate" {
 		p, err := loadPolicy(cfg.PolicyPath)
 		if err != nil {
@@ -167,6 +205,16 @@ func RunRelay(ctx context.Context, cfg RelayConfig) error {
 		for _, c := range closers {
 			c()
 		}
+		// Shutting down drops every client, as a process exit would, so
+		// devices and desktops reconnect to whatever relay comes next.
+		r.mu.Lock()
+		for _, e := range r.devices {
+			e.conn.Close()
+		}
+		for _, s := range r.sessions {
+			s.kill()
+		}
+		r.mu.Unlock()
 	})()
 	cfg.Events("ready", map[string]any{"addr": ln.Addr().String(), "mode": cfg.Mode, "ws": cfg.WSListen})
 	for {
@@ -203,32 +251,49 @@ func (r *relay) auditEvent(event string, f map[string]any) {
 
 func (r *relay) adminHandler(token string) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/revoke", func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
+	authed := func(w http.ResponseWriter, req *http.Request, method string) bool {
+		if req.Method != method {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
+			return false
 		}
 		want := "Bearer " + token
 		if subtle.ConstantTimeCompare([]byte(req.Header.Get("Authorization")), []byte(want)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
+			return false
 		}
+		return true
+	}
+	reply := func(w http.ResponseWriter, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(v)
+	}
+	target := func(w http.ResponseWriter, req *http.Request) (user, device string, ok bool) {
 		var body struct{ User, Device string }
 		if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 4096)).Decode(&body); err != nil ||
 			(body.User == "" && body.Device == "") {
 			http.Error(w, "bad request", http.StatusBadRequest)
+			return "", "", false
+		}
+		return body.User, body.Device, true
+	}
+	mux.HandleFunc("/v1/revoke", func(w http.ResponseWriter, req *http.Request) {
+		if !authed(w, req, http.MethodPost) {
+			return
+		}
+		user, device, ok := target(w, req)
+		if !ok {
 			return
 		}
 		var kill []*session
 		r.mu.Lock()
-		if body.User != "" {
-			r.revoked["user:"+body.User] = true
+		if user != "" {
+			r.revoked["user:"+user] = true
 		}
-		if body.Device != "" {
-			r.revoked["device:"+body.Device] = true
+		if device != "" {
+			r.revoked["device:"+device] = true
 		}
 		for sid, s := range r.sessions {
-			if (body.User != "" && s.user == body.User) || (body.Device != "" && s.device == body.Device) {
+			if (user != "" && s.user == user) || (device != "" && s.device == device) {
 				kill = append(kill, s)
 				delete(r.sessions, sid)
 			}
@@ -237,11 +302,184 @@ func (r *relay) adminHandler(token string) http.Handler {
 		for _, s := range kill {
 			s.kill()
 		}
-		r.auditEvent("revoked", map[string]any{"user": body.User, "device": body.Device, "sessions_killed": len(kill)})
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "sessions_killed": len(kill)})
+		perr := r.persistRevocations()
+		r.auditEvent("revoked", map[string]any{"user": user, "device": device, "sessions_killed": len(kill), "persisted": perr == nil})
+		if perr != nil {
+			// Revoked in memory (enforced now) but would not survive a restart.
+			logf("revocation not persisted: %v", perr)
+			http.Error(w, "revoked in memory but not persisted: "+perr.Error(), http.StatusInternalServerError)
+			return
+		}
+		reply(w, map[string]any{"ok": true, "sessions_killed": len(kill), "persisted": r.revFile != ""})
+	})
+	mux.HandleFunc("/v1/unrevoke", func(w http.ResponseWriter, req *http.Request) {
+		if !authed(w, req, http.MethodPost) {
+			return
+		}
+		user, device, ok := target(w, req)
+		if !ok {
+			return
+		}
+		r.mu.Lock()
+		if user != "" {
+			delete(r.revoked, "user:"+user)
+		}
+		if device != "" {
+			delete(r.revoked, "device:"+device)
+		}
+		r.mu.Unlock()
+		perr := r.persistRevocations()
+		r.auditEvent("unrevoked", map[string]any{"user": user, "device": device, "persisted": perr == nil})
+		if perr != nil {
+			http.Error(w, "unrevoked in memory but not persisted: "+perr.Error(), http.StatusInternalServerError)
+			return
+		}
+		reply(w, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("/v1/revocations", func(w http.ResponseWriter, req *http.Request) {
+		if !authed(w, req, http.MethodGet) {
+			return
+		}
+		users, devices := []string{}, []string{}
+		r.mu.Lock()
+		for k := range r.revoked {
+			if u, ok := strings.CutPrefix(k, "user:"); ok {
+				users = append(users, u)
+			} else if d, ok := strings.CutPrefix(k, "device:"); ok {
+				devices = append(devices, d)
+			}
+		}
+		r.mu.Unlock()
+		sort.Strings(users)
+		sort.Strings(devices)
+		reply(w, map[string]any{"users": users, "devices": devices})
+	})
+	mux.HandleFunc("/v1/devices", func(w http.ResponseWriter, req *http.Request) {
+		if !authed(w, req, http.MethodGet) {
+			return
+		}
+		reply(w, map[string]any{"devices": r.presence(nil, true)})
 	})
 	return mux
+}
+
+// presence lists connected devices, or, when only is non-nil, exactly the
+// devices in only (online or not). Revocation flags are for admins.
+func (r *relay) presence(only []string, admin bool) []DevicePresence {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sessions := map[string]int{}
+	for _, s := range r.sessions {
+		sessions[s.device]++
+	}
+	entry := func(id string) DevicePresence {
+		p := DevicePresence{DeviceID: id, Sessions: sessions[id]}
+		if e := r.devices[id]; e != nil {
+			since := e.since.UTC()
+			p.Online, p.ConnectedAt, p.Transport = true, &since, e.transport
+		}
+		if admin {
+			p.Revoked = r.revoked["device:"+id]
+		}
+		return p
+	}
+	out := []DevicePresence{}
+	if only != nil {
+		for _, id := range only {
+			if r.revoked["device:"+id] {
+				out = append(out, DevicePresence{DeviceID: id}) // revoked: never shown as available
+				continue
+			}
+			out = append(out, entry(id))
+		}
+		return out
+	}
+	for id := range r.devices {
+		out = append(out, entry(id))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DeviceID < out[j].DeviceID })
+	return out
+}
+
+type revocationFile struct {
+	Version int      `json:"version"`
+	Users   []string `json:"users"`
+	Devices []string `json:"devices"`
+}
+
+func loadRevocations(path string) (map[string]bool, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var f revocationFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		return nil, fmt.Errorf("%s is corrupt (%v); fix or remove it deliberately", path, err)
+	}
+	m := map[string]bool{}
+	for _, u := range f.Users {
+		m["user:"+u] = true
+	}
+	for _, d := range f.Devices {
+		m["device:"+d] = true
+	}
+	return m, nil
+}
+
+// persistRevocations writes the current list atomically (temp file, fsync,
+// rename) so a crash leaves either the old or the new list, never half.
+func (r *relay) persistRevocations() error {
+	if r.revFile == "" {
+		return nil
+	}
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	f := revocationFile{Version: 1, Users: []string{}, Devices: []string{}}
+	r.mu.Lock()
+	for k := range r.revoked {
+		if u, ok := strings.CutPrefix(k, "user:"); ok {
+			f.Users = append(f.Users, u)
+		} else if d, ok := strings.CutPrefix(k, "device:"); ok {
+			f.Devices = append(f.Devices, d)
+		}
+	}
+	r.mu.Unlock()
+	sort.Strings(f.Users)
+	sort.Strings(f.Devices)
+	b, _ := json.MarshalIndent(f, "", "  ")
+	if err := os.MkdirAll(filepath.Dir(r.revFile), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(r.revFile), ".revocations-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), r.revFile); err != nil {
+		return err
+	}
+	if d, err := os.Open(filepath.Dir(r.revFile)); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 // authenticate runs the corporate proof-of-possession exchange and returns
@@ -323,7 +561,7 @@ func (r *relay) handle(c net.Conn) {
 			h.Code = ""
 		}
 		c.SetReadDeadline(time.Time{})
-		e := &deviceEntry{conn: c, code: h.Code}
+		e := &deviceEntry{conn: c, code: h.Code, since: time.Now(), transport: relayTransport(c)}
 		if !r.corporate {
 			e.lan = h.LAN
 		}
@@ -474,6 +712,32 @@ func (r *relay) handle(c net.Conn) {
 		if r.corporate {
 			r.auditEvent("session_end", map[string]any{"user": user, "device": id, "session": sid})
 		}
+	case "presence":
+		// Which granted devices are online now (v1.1.0+, corporate): lets
+		// a desktop show real availability, authenticated exactly like a
+		// session open but without touching any device.
+		if limited("desktop") {
+			return
+		}
+		if !r.corporate {
+			writeHello(c, reply{OK: false, Reason: "presence requires corporate mode"})
+			c.Close()
+			return
+		}
+		sub, err := r.authenticate(c, br, h, "user")
+		if err != nil {
+			r.deny(c, map[string]any{"role": "presence"}, err.Error())
+			return
+		}
+		r.mu.Lock()
+		rev := r.revoked["user:"+sub]
+		r.mu.Unlock()
+		if rev {
+			r.deny(c, map[string]any{"user": sub, "role": "presence"}, "revoked")
+			return
+		}
+		writeHello(c, reply{OK: true, Devices: r.presence(r.pol.devicesFor(sub), false)})
+		c.Close()
 	default:
 		c.Close()
 	}

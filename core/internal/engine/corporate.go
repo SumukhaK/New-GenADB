@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -58,6 +59,25 @@ func (p *policy) granted(user, device string) bool {
 		}
 	}
 	return false
+}
+
+// devicesFor lists the devices granted to user, sorted and de-duplicated.
+func (p *policy) devicesFor(user string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, g := range p.Grants {
+		if g.User != user {
+			continue
+		}
+		for _, d := range g.Devices {
+			if !seen[d] {
+				seen[d] = true
+				out = append(out, d)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 type claims struct {

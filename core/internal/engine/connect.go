@@ -563,3 +563,32 @@ func loadPeer(state, id string) (ed25519.PublicKey, error) {
 	}
 	return ed25519.PublicKey(k), nil
 }
+
+// Presence asks the corporate relay which of the devices granted to this
+// user are online. It authenticates with the user token and proof of
+// possession like a session open, and touches no device.
+func Presence(ctx context.Context, cfg DesktopConfig) ([]DevicePresence, error) {
+	if cfg.Mode != "corporate" || cfg.Identity == "" {
+		return nil, fmt.Errorf("%w: presence needs corporate mode and an identity token", errDenied)
+	}
+	if cfg.Dial == nil {
+		cfg.Dial = cfg.Transport.Dialer()
+	}
+	if cfg.State == "" {
+		cfg.State = "."
+	}
+	key, err := loadOrCreateKey(cfg.State)
+	if err != nil {
+		return nil, err
+	}
+	a := &desktopAgent{relayAddr: cfg.Relay, key: key, token: cfg.Identity, tokenFn: cfg.Token, dial: cfg.Dial, ctx: ctx}
+	c, _, rep, err := a.openSessionRep(hello{Role: "presence"})
+	if err != nil {
+		return nil, err
+	}
+	c.Close()
+	if rep.Devices == nil {
+		rep.Devices = []DevicePresence{}
+	}
+	return rep.Devices, nil
+}

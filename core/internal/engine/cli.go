@@ -64,7 +64,7 @@ func cliRelay(ctx context.Context, args []string) error {
 	fs.StringVar(&c.PolicyPath, "policy", "", "policy file (corporate)")
 	fs.StringVar(&c.AuditPath, "audit", "", "hash-chained audit log path (JSONL); corporate default <state>/relay-audit.jsonl, and cannot be turned off")
 	fs.StringVar(&c.AuditKeyFile, "audit-anchor-key-file", "", "key that signs the audit log's anchor (default: audit-anchor.key next to the log)")
-	state := fs.String("state", ".", "directory for the relay's default audit log")
+	state := fs.String("state", ".", "directory for the relay's persisted revocations (revocations.json) and default audit log")
 	fs.StringVar(&c.AdminListen, "admin", "", "admin listen address")
 	fs.StringVar(&c.AdminToken, "admin-token", "", "admin bearer token")
 	fs.StringVar(&c.WSListen, "ws-listen", "", "also accept clients over WebSocket on this address (ws://, or wss:// with --tls-cert)")
@@ -89,6 +89,7 @@ func cliRelay(ctx context.Context, args []string) error {
 	if c.AuditPath != "" {
 		logf("audit log: %s", c.AuditPath)
 	}
+	c.StateDir = *state // revocations.json survives restarts
 	c.Events = StdoutEvents
 	return RunRelay(ctx, c)
 }

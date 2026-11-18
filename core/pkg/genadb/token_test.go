@@ -190,3 +190,19 @@ func TestWatchIdentityFileRotatesAndReportsBadTokens(t *testing.T) {
 		t.Fatalf("second event %+v", got[1])
 	}
 }
+
+// dialADB opens an adb connection through a session and leaves it open.
+func dialADB(addr string) (net.Conn, error) {
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	c.Write(amsg(aCNXN, 0x01000001, 256*1024, []byte("host::\x00")))
+	c.SetReadDeadline(time.Now().Add(15 * time.Second))
+	if _, err := readMsg(c); err != nil {
+		c.Close()
+		return nil, err
+	}
+	c.SetReadDeadline(time.Time{})
+	return c, nil
+}
