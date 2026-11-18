@@ -92,6 +92,9 @@ type RelayConfig struct {
 	TLSKey         string
 	TrustForwarded bool      // take client IPs from proxy headers on WSListen
 	Events         EventFunc // receives "ready"; nil = discard
+	// StateDir keeps relay state that must survive restarts (v1.1.0+):
+	// revocations.json. "" = revocations live in memory only.
+	StateDir string
 }
 
 // RunRelay serves the relay until ctx is cancelled.

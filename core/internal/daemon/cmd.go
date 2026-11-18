@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/sumukhak/new-genadb/core/pkg/genadb"
 )
@@ -115,6 +116,10 @@ func run(name string, args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *mode == "corporate" {
+		// Rotating the identity file rotates the token of live sessions.
+		go c.WatchIdentityFile(ctx, *identityFile, 2*time.Second)
+	}
 	if *useStdio {
 		return srv.ServeConn(ctx, stdio{})
 	}

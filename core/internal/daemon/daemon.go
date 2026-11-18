@@ -331,6 +331,18 @@ func (s *Server) call(ctx context.Context, c *conn, req request) (any, error) {
 	}
 	cl := s.Client
 	switch req.Method {
+	case "auth.set_token":
+		var p struct {
+			Token string `json:"token"`
+		}
+		if err := decode(req.Params, &p); err != nil {
+			return nil, err
+		}
+		if p.Token == "" {
+			return nil, &Error{Code: CodeInvalidParams, Message: "token is required"}
+		}
+		return cl.SetToken(p.Token)
+
 	case "version":
 		return map[string]any{"version": genadb.Version, "mode": cl.Mode(), "audit": cl.AuditPath() != ""}, nil
 

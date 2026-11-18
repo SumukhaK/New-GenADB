@@ -27,8 +27,11 @@ type desktopAgent struct {
 	audit                   audit.Sink
 	user, tokenID, deviceID string
 
-	mode string
-	pol  *policy
+	mode     string
+	pol      *policy
+	tokenFn  func() string
+	idMu     sync.Mutex // guards user, tokenID, auditTok
+	auditTok string     // the token user/tokenID were derived from
 
 	mu      sync.Mutex
 	tunnels map[*tunnel]struct{}
@@ -53,6 +56,11 @@ type DesktopConfig struct {
 	Events     EventFunc        // receives events; nil = discard
 	Audit      audit.Sink       // receives session/operation records; nil = none
 	Label      string           // display name for this computer on the phone (v1.1.0+; sent end-to-end encrypted)
+	// Token, when set, returns the current corporate identity token. It is
+	// consulted for every new stream and rejoin, so a rotated token takes
+	// effect without restarting the session (v1.1.0+). Identity is the
+	// token used when Token is nil.
+	Token func() string
 }
 
 // RunDesktop pairs (if a code is given), verifies the device, exposes a local
@@ -144,7 +152,8 @@ func newDesktop(cfg *DesktopConfig) (*desktopAgent, initiatorParams, error) {
 	}
 	a := &desktopAgent{relayAddr: cfg.Relay, state: cfg.State, key: key, token: cfg.Identity, dial: cfg.Dial,
 		events: cfg.Events, audit: cfg.Audit, tunnels: map[*tunnel]struct{}{}, mode: cfg.Mode}
-	params := initiatorParams{id: key, mode: "resume", token: cfg.Identity, label: cleanReason([]byte(cfg.Label))}
+	a.tokenFn = cfg.Token
+	params := initiatorParams{id: key, mode: "resume", token: cfg.Identity, tokenFn: cfg.Token, label: cleanReason([]byte(cfg.Label))}
 	if cfg.Mode == "corporate" {
 		if cfg.Identity == "" {
 			return nil, params, fmt.Errorf("%w: corporate mode requires an identity token", errDenied)
@@ -158,9 +167,7 @@ func newDesktop(cfg *DesktopConfig) (*desktopAgent, initiatorParams, error) {
 		}
 		a.pol = pol
 		// Audit identity: the token's subject and ID, never the token itself.
-		if cl, err := pol.verifyToken(cfg.Identity, "user", key.Public().(ed25519.PublicKey)); err == nil {
-			a.user, a.tokenID = cl.Sub, cl.Jti
-		}
+		a.identity()
 		want := cfg.Device
 		// the device must prove an MDM enrollment bound to the key it uses
 		params.verifyPeer = func(peer ed25519.PublicKey, tok string) error {
@@ -335,17 +342,43 @@ func (a *desktopAgent) serveADB(conn net.Conn, id, lan string, params initiatorP
 	}
 }
 
+// currentToken is the corporate token to present now (it may have been
+// rotated since the session started).
+func (a *desktopAgent) currentToken() string {
+	if a.tokenFn != nil {
+		if t := a.tokenFn(); t != "" {
+			return t
+		}
+	}
+	return a.token
+}
+
+// identity returns the audit identity (subject and token id, never the
+// token), following token rotation.
+func (a *desktopAgent) identity() (user, tokenID string) {
+	a.idMu.Lock()
+	defer a.idMu.Unlock()
+	if tok := a.currentToken(); a.pol != nil && tok != a.auditTok {
+		a.auditTok = tok
+		if cl, err := a.pol.verifyToken(tok, "user", a.key.Public().(ed25519.PublicKey)); err == nil {
+			a.user, a.tokenID = cl.Sub, cl.Jti
+		}
+	}
+	return a.user, a.tokenID
+}
+
 func (a *desktopAgent) record(e audit.Event) {
 	if a.audit == nil {
 		return
 	}
 	e["role"] = "desktop"
 	e["device"] = a.deviceID
-	if a.user != "" {
-		e["user"] = a.user
+	user, tokenID := a.identity()
+	if user != "" {
+		e["user"] = user
 	}
-	if a.tokenID != "" {
-		e["token_id"] = a.tokenID
+	if tokenID != "" {
+		e["token_id"] = tokenID
 	}
 	if err := a.audit.Write(e); err != nil {
 		logf("audit write failed: %v", err)
@@ -463,7 +496,7 @@ func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, 
 		return nil, nil, reply{}, err
 	}
 	br := bufio.NewReader(c)
-	h.Identity = a.token
+	h.Identity = a.currentToken()
 	// A relay that accepts the connection but never answers must not hang
 	// the caller: bound the whole rendezvous exchange.
 	c.SetDeadline(time.Now().Add(rendezvousTimeout))

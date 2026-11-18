@@ -28,3 +28,17 @@ func TestDaemonPairADBValidation(t *testing.T) {
 		t.Fatal("unknown params accepted")
 	}
 }
+
+func TestDaemonSetTokenNeedsAuthAndCorporateMode(t *testing.T) {
+	_, r := setup(t, "tok")
+	if errCode(r.call("auth.set_token", map[string]any{"token": "a.b.c"})) != CodeUnauthorized {
+		t.Fatal("auth.set_token before auth")
+	}
+	r.call("auth", map[string]any{"token": "tok"})
+	if errCode(r.call("auth.set_token", map[string]any{})) != CodeInvalidParams {
+		t.Fatal("empty token accepted")
+	}
+	if m := r.call("auth.set_token", map[string]any{"token": "a.b.c"}); errCode(m) != CodeDenied {
+		t.Fatalf("solo daemon accepted a token: %v", m)
+	}
+}

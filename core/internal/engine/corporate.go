@@ -145,3 +145,30 @@ func popMessage(challenge []byte, token string) []byte {
 	th := sha256.Sum256([]byte(token))
 	return append(append([]byte("genadb-relay-pop-v1"), challenge...), th[:]...)
 }
+
+// TokenInfo is what a verified user token says (never the token itself).
+type TokenInfo struct {
+	Subject string
+	TokenID string
+	Expires time.Time
+}
+
+// VerifyUserToken checks a corporate user token the way the relay and the
+// device will: signature, issuer, audience, validity, type "user", and its
+// binding to this machine's identity key in state. Failures wrap ErrDenied
+// and ErrTokenExpired or ErrTokenInvalid.
+func VerifyUserToken(policyPath, state, token string) (TokenInfo, error) {
+	pol, err := loadPolicy(policyPath)
+	if err != nil {
+		return TokenInfo{}, err
+	}
+	key, err := loadOrCreateKey(state)
+	if err != nil {
+		return TokenInfo{}, err
+	}
+	cl, err := pol.verifyToken(token, "user", key.Public().(ed25519.PublicKey))
+	if err != nil {
+		return TokenInfo{}, deniedError("token: " + err.Error())
+	}
+	return TokenInfo{Subject: cl.Sub, TokenID: cl.Jti, Expires: time.Unix(cl.Exp, 0).UTC()}, nil
+}

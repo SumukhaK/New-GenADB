@@ -36,6 +36,10 @@ type SetuClient struct {
 	dispDone chan struct{}
 	dropped  atomic.Uint64
 
+	tokMu       sync.Mutex
+	tokOverride atomic.Pointer[string] // set by SetToken
+	tokSubject  string
+
 	mu       sync.Mutex
 	sessions map[string]*SetuSession
 	seq      int
@@ -442,11 +446,18 @@ func (c *SetuClient) desktopConfig(ctx context.Context, deviceID string) (engine
 		Label:  c.cfg.label,
 	}
 	if c.cfg.mode == ModeCorporate {
-		tok, err := c.cfg.auth.Token(ctx)
+		tok, err := c.currentToken(ctx)
 		if err != nil {
 			return cfg, fmt.Errorf("%w: %w", ErrTokenInvalid, err)
 		}
 		cfg.Identity, cfg.PolicyPath = tok, c.cfg.policyPath
+		// Live rotation: streams opened later use the token current then.
+		cfg.Token = func() string {
+			if t := c.tokOverride.Load(); t != nil {
+				return *t
+			}
+			return tok
+		}
 	}
 	return cfg, nil
 }
