@@ -10,7 +10,7 @@
 //		genadb.WithRelayURL("wss://relay.example.com/"),
 //		genadb.WithStateDir("~/.setu"),
 //	)
-//	sess, err := c.Connect(ctx, genadb.ConnectRequest{PairingCode: "1234-ABCDEF"})
+//	sess, err := c.Connect(ctx, genadb.ConnectRequest{PairingCode: "1234-567890"})
 //	fmt.Println("adb connect", sess.ADBAddr())
 //
 // Client and Session, the names used before v1.0.1, remain as aliases of

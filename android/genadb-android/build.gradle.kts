@@ -9,7 +9,7 @@ plugins {
     kotlin("android")
 }
 
-val setuVersion = "1.0.1"
+val setuVersion = "1.1.0"
 
 android {
     namespace = "dev.genadb.sdk"

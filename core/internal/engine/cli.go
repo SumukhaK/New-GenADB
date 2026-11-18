@@ -164,6 +164,7 @@ func cliConnect(ctx context.Context, args []string) error {
 	AddTransportFlags(fs, &c.Transport)
 	fs.StringVar(&c.Code, "code", "", "pairing code shown on the phone (NNNN-SSSSSS)")
 	fs.StringVar(&c.Device, "device", "", "previously paired device id")
+	fs.StringVar(&c.Label, "label", "", "name shown for this computer in the phone's session list (v1.1.0)")
 	fs.StringVar(&c.Identity, "identity", "", "user identity JWT (corporate)")
 	fs.StringVar(&c.PolicyPath, "policy", "", "policy file (corporate)")
 	auditPath := fs.String("audit", "", "record sessions and adb operations to this hash-chained JSONL file; corporate default <state>/audit.jsonl, and cannot be turned off")

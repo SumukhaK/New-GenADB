@@ -28,7 +28,7 @@ func TestBothNamesRunTheSameCommands(t *testing.T) {
 			t.Fatalf("%s audit verify of a missing log must fail", name)
 		}
 	}
-	if engine.Version != "1.0.1" {
+	if engine.Version != "1.1.0" {
 		t.Fatalf("version %s", engine.Version)
 	}
 }

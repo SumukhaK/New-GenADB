@@ -16,7 +16,7 @@
 **Use a real Android phone from anywhere as if it were plugged into your computer.** Setu (Sanskrit for "bridge") connects Android Studio, any IDE, or plain `adb` to a physical device on another network: across the office, across the country, or behind a carrier NAT. You can deploy APKs and AABs, stream logcat, debug, push and pull files, and take screenshots.
 
 ```
-$ setu connect --relay wss://relay.example.com/ --code 4821-K7QZPM
+$ setu connect --relay wss://relay.example.com/ --code 4821-093357
 {"event":"listening","addr":"127.0.0.1:41377","device_id":"pixel-7-…"}
 $ adb connect 127.0.0.1:41377
 $ adb install app-debug.apk      # Android Studio sees the device too
@@ -159,20 +159,28 @@ cd core && go build -o setu ./cmd/setu
 
 # 2. On the phone: the companion app (android/) or the agent itself
 ./setu device --relay wss://relay.example.com:8443/ --adbd auto
-#   -> {"event":"pairing_code","code":"4821-K7QZPM",...}
+#   -> {"event":"pairing_code","code":"4821-093357",...}
 
 # 3. On your computer
-./setu connect --relay wss://relay.example.com:8443/ --code 4821-K7QZPM
+./setu connect --relay wss://relay.example.com:8443/ --code 4821-093357
 adb connect 127.0.0.1:<port from the "listening" event>
 
 # Later: no code needed
-./setu connect --relay wss://relay.example.com:8443/ --device <device id>
+./setu connect --relay wss://relay.example.com:8443/ --device <device id> --label "$(hostname)"
+
+# Android 11+ Wireless debugging (TLS adbd): pair this computer's adb through the tunnel once.
+# On the phone: Wireless debugging > "Pair device with pairing code" shows a port and a 6-digit code.
+./setu adb-pair --relay wss://relay.example.com:8443/ --device <device id> --port 37099 --code 482913
 
 # Something wrong? Check adb, state, proxy settings and relay reachability
 ./setu doctor --relay wss://relay.example.com:8443/
 ```
 
+The pairing code the phone shows is 10 digits, `NNNN-NNNNNN`: a 4-digit nameplate that finds the device on the relay and a 6-digit secret that never leaves the two ends (it feeds a SPAKE2 exchange). It is single-use, expires, and is burned after a few wrong guesses. The six-digit code in Android's own *Pair device with pairing code* dialog is a different code; it goes to `setu adb-pair`.
+
 ## Quickstart: Go SDK
+
+The module path is `github.com/sumukhak/new-genadb/core` (see `core/go.mod`). It is unchanged by the Setu rename and by the repository moving on GitHub, so keep that import path; inside this repository use a `replace` directive or `go.work` pointing at `core/`.
 
 ```go
 import (
@@ -198,7 +206,7 @@ func main() {
     }
     defer c.Close()
 
-    sess, err := c.Connect(ctx, genadb.ConnectRequest{PairingCode: "4821-K7QZPM"})
+    sess, err := c.Connect(ctx, genadb.ConnectRequest{PairingCode: "4821-093357"})
     switch {
     case errors.Is(err, genadb.ErrBadCode):
         // ask the user to re-enter the code
@@ -206,6 +214,12 @@ func main() {
         panic(err)
     }
     fmt.Println("adb connect", sess.ADBAddr())
+
+    // Android 11+: pair adb once through the tunnel (port and code from the phone's dialog).
+    c.PairADB(ctx, genadb.PairADBRequest{DeviceID: sess.DeviceID(), PairingPort: 37099, PairingCode: "482913"})
+
+    // Corporate: rotate the identity token without dropping sessions.
+    //   c.SetToken(newJWT)  or  go c.WatchIdentityFile(ctx, "/run/setu/identity.jwt", 2*time.Second)
 
     // Corporate deployments: genadb.WithCorporateToken(token, policyPath) turns on
     // policy checks and a hash-chained audit log. Export it at any time:
@@ -218,7 +232,7 @@ Other languages can use `setu-daemon`, which offers the same operations over JSO
 ## Quickstart: Android (Kotlin)
 
 ```kotlin
-// settings.gradle.kts: include(":genadb-android"), or depend on setu-android-1.0.1.aar
+// settings.gradle.kts: include(":genadb-android"), or depend on setu-android-1.1.0.aar
 // app/build.gradle.kts: packaging { jniLibs { useLegacyPackaging = true } }
 
 val setu = SetuManager.initialize(
@@ -238,12 +252,32 @@ lifecycleScope.launch {
     }
 }
 val code = setu.pair()               // suspend; solo mode
+
+// Who is debugging this phone right now, and an "End" button for each session
+lifecycleScope.launch {
+    setu.sessions.collect { list -> list.forEach { show(it.peerLabel, it.transport, it.path) } }
+}
+setu.endSession(sessionId)           // the desktop sees a graceful peer_closed
 setu.stop()
 ```
 
+Show the pairing code with `SetuNotifications.content(state, sessions)`: it returns the full text for the unlocked phone and a `publicText` without the code for the lock screen (post with `VISIBILITY_PRIVATE` and `setPublicVersion`).
+
 In corporate mode, the relay URL, enrollment token and policy come from EMM managed configuration. Device-side audit records then appear on `setu.auditEvents`.
 
-Build the library with `./gradlew :genadb-android:assembleRelease`, which writes `genadb-android/build/outputs/aar/setu-android-1.0.1.aar`. The AAR carries `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES.txt` under `assets/setu-sdk/`. The build cross-compiles the Go core, so Go 1.24+ must be on `PATH`.
+Build the library with `./gradlew :genadb-android:assembleRelease`, which writes `genadb-android/build/outputs/aar/setu-android-1.1.0.aar`. The AAR carries `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES.txt` under `assets/setu-sdk/`. The build cross-compiles the Go core, so Go 1.24+ must be on `PATH`.
+
+## What's new in 1.1.0
+
+- **Android 11+ pairing over the tunnel:** `setu adb-pair`, `SetuClient.PairADB` and the daemon's `session.pair_adb` run `adb pair` against the phone's `_adb-tls-pairing._tcp` service through the encrypted tunnel, so TLS adbd accepts the computer without being on the same Wi-Fi.
+- **Live token rotation:** `auth.set_token`, `SetuClient.SetToken` and an automatic watch on `--identity-file`. Sessions keep running, and the audit trail records `token_rotated`.
+- **Daemon for UIs:** requests run concurrently, `session.cancel` stops a pending connect, a `{"event":"daemon_ready","listen":"127.0.0.1:PORT"}` line on stdout announces the port, and `events.dropped` tells slow subscribers what they missed.
+- **Relay state:** revocations survive relay restarts (`revocations.json` in `--state`), and `GET /v1/devices` / `devices.presence` show which devices are online.
+- **Path events:** `path_down`, `path_up` (with `transport` `lan|relay-tcp|relay-ws|relay-wss`) and `path_lost`, on the Go SDK and the CLI, and on Android through `ConnectionState.Online.path` and `SetuManager.sessions`.
+- **Corporate controls:** `max_session_seconds` is a hard cap that requires re-authentication (rejoining cannot extend it), and `setu policy scope` / `GET /v1/policy?device=` give each phone only its own grants.
+- **On the phone:** `SetuManager.sessions` (who is connected, `peer_label`, `transport`), `SetuManager.endSession(id)`, and a lock-screen notification that never shows the pairing code.
+
+All of it interoperates with 1.0 peers; features the other side lacks fail with `ErrUnsupported`. See [API_SPEC.md](API_SPEC.md) for the full contract.
 
 ## Audit and reports
 
@@ -288,7 +322,7 @@ These figures come from the locked evaluation harness (`eval.py`, a simulated WA
 
 | Path | What |
 |---|---|
-| `core/cmd/setu`, `core/cmd/genadb` | CLI: `relay`, `device`, `connect`, `keygen`, `doctor`, `audit`, `version` (two names, one program) |
+| `core/cmd/setu`, `core/cmd/genadb` | CLI: `relay`, `device`, `connect`, `adb-pair`, `keygen`, `doctor`, `audit`, `policy`, `version` (two names, one program) |
 | `core/cmd/setu-daemon`, `core/cmd/genadb-daemon` | JSON-RPC 2.0 daemon for IDE plugins and UIs |
 | `core/pkg/genadb` | Public Go SDK |
 | `core/pkg/genadb/audit` | Hash-chained audit log, reports, webhook sink |
