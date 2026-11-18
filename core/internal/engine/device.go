@@ -9,10 +9,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -335,9 +337,19 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		}
 		return
 	}
-	sc, _, err := serverHandshake(c, c, d.policy(), b1, m1)
+	sc, hs, err := serverHandshake(c, c, d.policy(), b1, m1)
 	if err != nil {
 		logf("handshake failed: %v", err)
+		c.Close()
+		return
+	}
+	if strings.HasPrefix(hs.meta.Target, "adb-pair:") {
+		release()
+		d.servePairing(sc, hs)
+		return
+	}
+	if hs.meta.Target != "" {
+		logf("unknown stream target %q", hs.meta.Target)
 		c.Close()
 		return
 	}
@@ -349,7 +361,10 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		return
 	}
 	release()
-	t := newTunnel(sc, accelerate(a), false)
+	d.runTunnel(newTunnel(sc, accelerate(a), false))
+}
+
+func (d *deviceAgent) runTunnel(t *tunnel) {
 	key := hex.EncodeToString(t.sid)
 	d.mu.Lock()
 	d.tunnels[key] = t
@@ -359,6 +374,84 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 	delete(d.tunnels, key)
 	d.mu.Unlock()
 }
+
+// servePairing carries an Android 11+ Wireless-debugging pairing exchange
+// (adb pair, _adb-tls-pairing._tcp) from an authenticated desktop to the
+// pairing service on this phone. The pairing code itself never reaches us:
+// adb on the desktop and adbd run their own SPAKE2 exchange inside our
+// end-to-end encrypted tunnel.
+func (d *deviceAgent) servePairing(sc *secureConn, hs handshakeResult) {
+	port, err := strconv.Atoi(strings.TrimPrefix(hs.meta.Target, "adb-pair:"))
+	if err != nil || port < 0 || port > 65535 {
+		sc.Close()
+		return
+	}
+	pc, addr, err := d.dialPairing(port)
+	if err != nil {
+		logf("adb pairing service unreachable: %v", err)
+		d.events("adb_pair_unreachable", map[string]any{"port": port, "reason": err.Error()})
+		t := newTunnel(sc, &nopConn{}, false)
+		t.closeWith("pairing service unreachable: open Wireless debugging > Pair device with pairing code on the phone")
+		return
+	}
+	d.events("adb_pair_open", map[string]any{"addr": addr})
+	d.runTunnel(newTunnel(sc, pc, false))
+	d.events("adb_pair_closed", map[string]any{"addr": addr})
+}
+
+// dialPairing finds the Wireless-debugging pairing service. port is what the
+// phone's "Pair device with pairing code" dialog shows (0 = discover it).
+func (d *deviceAgent) dialPairing(port int) (net.Conn, string, error) {
+	var cands []string
+	if port > 0 {
+		if a, err := d.adbd.current(); err == nil {
+			if h, _, err := net.SplitHostPort(a); err == nil {
+				cands = append(cands, net.JoinHostPort(h, strconv.Itoa(port)))
+			}
+		}
+		if lo := net.JoinHostPort("127.0.0.1", strconv.Itoa(port)); len(cands) == 0 || cands[0] != lo {
+			cands = append(cands, lo)
+		}
+	}
+	var last error = fmt.Errorf("no pairing service advertised")
+	for _, a := range cands {
+		c, err := dialTimeout(a, adbdDialTimeout)
+		if err == nil {
+			return c, a, nil
+		}
+		last = err
+	}
+	if pairingBrowse == nil {
+		return nil, "", last
+	}
+	eps, err := pairingBrowse()
+	if err != nil && len(eps) == 0 {
+		return nil, "", fmt.Errorf("%v; mDNS: %v", last, err)
+	}
+	for _, ep := range eps {
+		if _, p, _ := net.SplitHostPort(ep); port > 0 && p != strconv.Itoa(port) {
+			continue
+		}
+		if c, err := dialTimeout(ep, adbdDialTimeout); err == nil {
+			return c, ep, nil
+		} else {
+			last = err
+		}
+	}
+	return nil, "", last
+}
+
+// pairingBrowse discovers _adb-tls-pairing._tcp endpoints (overridable in tests).
+var pairingBrowse = func() ([]string, error) {
+	return browse("_adb-tls-pairing._tcp.local.", 1500*time.Millisecond)
+}
+
+// nopConn stands in for the local side of a tunnel that is closed at once.
+type nopConn struct{ net.Conn }
+
+func (*nopConn) Read([]byte) (int, error)    { return 0, io.EOF }
+func (*nopConn) Write(b []byte) (int, error) { return len(b), nil }
+func (*nopConn) Close() error                { return nil }
 
 func (d *deviceAgent) lookupTunnel(sid string) *tunnel {
 	d.mu.Lock()

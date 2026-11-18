@@ -25,6 +25,9 @@ const (
 	recData = 1
 	recAck  = 2
 	recFin  = 3
+	// recClose (v1.1.0+) ends the tunnel on purpose; the payload is a short
+	// reason. The receiver closes without trying to rejoin.
+	recClose = 4
 
 	maxUnacked   = 16 << 20
 	ackEvery     = 128 << 10
@@ -61,11 +64,14 @@ type tunnel struct {
 	closed   bool
 	broken   chan struct{} // signalled when current conn fails
 	lastRecv time.Time     // last record received on the current conn
+
+	peerCaps   []string
+	peerReason string // reason the peer gave in a close record ("" = none)
 }
 
 func newTunnel(sc *secureConn, local net.Conn, initiator bool) *tunnel {
 	t := &tunnel{sid: sc.sid, resumeKey: sc.resumeKey, initiator: initiator, local: local,
-		broken: make(chan struct{}, 1)}
+		broken: make(chan struct{}, 1), peerCaps: sc.peerCaps}
 	t.cond = sync.NewCond(&t.mu)
 	t.attach(sc, 0)
 	return t
@@ -134,6 +140,39 @@ func (t *tunnel) close() {
 	case t.broken <- struct{}{}:
 	default:
 	}
+}
+
+// closeWith ends the tunnel on purpose and, when the peer understands it,
+// tells it why so it does not try to rejoin.
+func (t *tunnel) closeWith(reason string) {
+	t.mu.Lock()
+	c := t.conn
+	t.mu.Unlock()
+	if c != nil && hasCap(t.peerCaps, capClose) {
+		c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		c.Write(record(recClose, 0, []byte(reason)))
+	}
+	t.close()
+}
+
+// PeerReason is the reason the peer gave for closing ("" if it did not).
+func (t *tunnel) PeerReason() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.peerReason
+}
+
+func cleanReason(b []byte) string {
+	if len(b) > 128 {
+		b = b[:128]
+	}
+	out := make([]rune, 0, len(b))
+	for _, r := range string(b) {
+		if r >= 0x20 && r != 0x7f {
+			out = append(out, r)
+		}
+	}
+	return string(out)
 }
 
 func record(typ byte, off uint64, payload []byte) []byte {
@@ -367,6 +406,15 @@ func (t *tunnel) reader(sc *secureConn, ep int) {
 			t.mu.Lock()
 			t.ackLocked(off)
 			t.mu.Unlock()
+		case recClose:
+			t.mu.Lock()
+			t.peerReason = cleanReason(payload)
+			if t.peerReason == "" {
+				t.peerReason = "closed"
+			}
+			t.mu.Unlock()
+			t.close()
+			return
 		case recFin:
 			t.mu.Lock()
 			done := off == t.recvNext

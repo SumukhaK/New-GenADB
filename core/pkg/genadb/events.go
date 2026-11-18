@@ -11,6 +11,7 @@ const (
 	EventRetrying    = "retrying"     // a session is being restarted; Fields["attempt"], ["error"]
 	EventAudit       = "audit"        // an audit record was written; Fields is the record
 	EventError       = "error"        // a non-fatal error; Fields["error"]
+	EventADBPair     = "adb_pair"     // PairADB finished; Fields["device_id"], ["paired"], ["transport"] or ["error"]
 )
 
 // Event is a structured notification from the client or one of its sessions.

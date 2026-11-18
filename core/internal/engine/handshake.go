@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"fmt"
+
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/hkdf"
@@ -34,6 +36,70 @@ type hsMsg struct {
 	Sig   []byte `json:"sig,omitempty"`
 	MAC   []byte `json:"mac,omitempty"`
 	Err   string `json:"err,omitempty"`
+	// Caps (v1.1.0+) lists optional features. A desktop announces its own in
+	// M1; a device answers with its capabilities in M2 only when M1 carried
+	// some, so a v1.0.x desktop (which re-encodes M2 for the transcript)
+	// never sees a field it would drop.
+	Caps []string `json:"caps,omitempty"`
+	// Meta (v1.1.0+, M3) is the AEAD-sealed handshakeMeta: what the
+	// desktop wants this stream for, and its display label. It is sealed
+	// under a key derived from the session secret, so the relay learns
+	// neither.
+	Meta []byte `json:"meta,omitempty"`
+}
+
+// Capabilities exchanged in hsMsg.Caps.
+const (
+	capV11     = "v1.1"     // desktop: understands device capabilities
+	capADBPair = "adb-pair" // device: tunnels Wireless-debugging pairing
+	capClose   = "close"    // both: understands the graceful close record
+)
+
+var deviceCaps = []string{capV11, capADBPair, capClose}
+
+func hasCap(caps []string, c string) bool {
+	for _, x := range caps {
+		if x == c {
+			return true
+		}
+	}
+	return false
+}
+
+// handshakeMeta travels sealed in M3.
+type handshakeMeta struct {
+	// Target is "" (adbd) or "adb-pair:<port>" (Android 11+ Wireless
+	// debugging pairing service; port 0 = discover it on the device).
+	Target string `json:"target,omitempty"`
+	// Label is the desktop's display name for the phone's session list.
+	Label string `json:"label,omitempty"`
+}
+
+func metaAEADKey(k keys) []byte {
+	mk, _ := hkdf.Key(sha256.New, k.confirm, nil, "genadb handshake meta v1", 32)
+	return mk
+}
+
+// sealMeta / openMeta use a key used for exactly one message, so a fixed
+// nonce is safe.
+func sealMeta(k keys, m handshakeMeta) []byte {
+	b, _ := json.Marshal(m)
+	return newAEAD(metaAEADKey(k)).Seal(nil, make([]byte, 12), b, []byte("meta"))
+}
+
+func openMeta(k keys, ct []byte) (handshakeMeta, error) {
+	var m handshakeMeta
+	if len(ct) == 0 {
+		return m, nil
+	}
+	pt, err := newAEAD(metaAEADKey(k)).Open(nil, make([]byte, 12), ct, []byte("meta"))
+	if err != nil {
+		return m, errors.New("handshake metadata failed authentication")
+	}
+	if err := json.Unmarshal(pt, &m); err != nil {
+		return m, errors.New("bad handshake metadata")
+	}
+	return m, nil
 }
 
 func writeMsg(w io.Writer, m any) ([]byte, error) {
@@ -109,6 +175,16 @@ type initiatorParams struct {
 	pinnedPeer ed25519.PublicKey // resume mode: expected device key
 	token      string            // corporate user token
 	verifyPeer func(peerID ed25519.PublicKey, token string) error
+	tokenFn    func() string // current corporate token (live rotation); overrides token
+	target     string        // "" = adbd, "adb-pair:<port>" = pairing service
+	label      string        // display label shown on the phone
+}
+
+func (p initiatorParams) currentToken() string {
+	if p.tokenFn != nil {
+		return p.tokenFn()
+	}
+	return p.token
 }
 
 // clientHandshake runs the desktop side. Returns the secure channel and the
@@ -117,7 +193,8 @@ func clientHandshake(c net.Conn, r io.Reader, p initiatorParams) (*secureConn, e
 	c.SetDeadline(time.Now().Add(15 * time.Second))
 	defer c.SetDeadline(time.Time{})
 	eph, _ := ecdh.X25519().GenerateKey(rand.Reader)
-	m1 := hsMsg{Mode: p.mode, Eph: eph.PublicKey().Bytes(), ID: p.id.Public().(ed25519.PublicKey), Token: p.token}
+	m1 := hsMsg{Mode: p.mode, Eph: eph.PublicKey().Bytes(), ID: p.id.Public().(ed25519.PublicKey), Token: p.currentToken(),
+		Caps: []string{capV11, capClose}}
 	var sp *spake
 	if p.mode == "pair" {
 		sp = newSpake("B", p.secret, p.nameplate)
@@ -170,10 +247,16 @@ func clientHandshake(c net.Conn, r io.Reader, p initiatorParams) (*secureConn, e
 			return nil, nil, err
 		}
 	}
+	if p.target != "" && !hasCap(m2.Caps, capADBPair) {
+		return nil, nil, fmt.Errorf("%w: %w: adb pairing needs Setu-SDK 1.1.0 or later on the device", errDenied, ErrUnsupported)
+	}
 	th2 := thash(th1, m2.Sig)
 	m3 := hsMsg{Sig: ed25519.Sign(p.id, append([]byte("genadb-desk-sig"), th2...))}
 	if sp != nil {
 		m3.MAC = mac(k.confirm, "desktop", th2)
+	}
+	if p.target != "" || p.label != "" {
+		m3.Meta = sealMeta(k, handshakeMeta{Target: p.target, Label: p.label})
 	}
 	if _, err := writeMsg(c, m3); err != nil {
 		return nil, nil, err
@@ -186,7 +269,9 @@ func clientHandshake(c net.Conn, r io.Reader, p initiatorParams) (*secureConn, e
 	if ack.Err != "" {
 		return nil, nil, errors.New(ack.Err)
 	}
-	return makeSecure(c, r, k, true), peerID, nil
+	sc := makeSecure(c, r, k, true)
+	sc.peerCaps = m2.Caps
+	return sc, peerID, nil
 }
 
 // responderPolicy lets the device decide per handshake.
@@ -201,12 +286,21 @@ type responderPolicy struct {
 	token     string // device's own token (corporate)
 }
 
-func serverHandshake(c net.Conn, r io.Reader, p responderPolicy, b1 []byte, m1 hsMsg) (*secureConn, ed25519.PublicKey, error) {
+// handshakeResult is what the device learns about an authenticated peer.
+type handshakeResult struct {
+	peer  ed25519.PublicKey
+	token string // the peer's corporate token (already checked by authorize)
+	caps  []string
+	meta  handshakeMeta
+}
+
+func serverHandshake(c net.Conn, r io.Reader, p responderPolicy, b1 []byte, m1 hsMsg) (*secureConn, handshakeResult, error) {
+	var res handshakeResult
 	c.SetDeadline(time.Now().Add(15 * time.Second))
 	defer c.SetDeadline(time.Time{})
 	var err error
 	if len(m1.ID) != ed25519.PublicKeySize {
-		return nil, nil, errors.New("bad peer identity")
+		return nil, res, errors.New("bad peer identity")
 	}
 	peerID := ed25519.PublicKey(m1.ID)
 	var sp *spake
@@ -215,13 +309,13 @@ func serverHandshake(c net.Conn, r io.Reader, p responderPolicy, b1 []byte, m1 h
 		secret, nameplate, ok := p.pairing()
 		if !ok {
 			writeMsg(c, hsMsg{Err: "no active pairing code"})
-			return nil, nil, errors.New("pairing not active")
+			return nil, res, errors.New("pairing not active")
 		}
 		sp = newSpake("A", secret, nameplate)
 	default:
 		if err := p.authorize(peerID, m1.Token); err != nil {
 			writeMsg(c, hsMsg{Err: "not authorized"})
-			return nil, nil, err
+			return nil, res, err
 		}
 	}
 	eph, _ := ecdh.X25519().GenerateKey(rand.Reader)
@@ -229,21 +323,24 @@ func serverHandshake(c net.Conn, r io.Reader, p responderPolicy, b1 []byte, m1 h
 	if sp != nil {
 		m2.Pake = sp.msg
 	}
+	if len(m1.Caps) > 0 {
+		m2.Caps = deviceCaps // only to desktops that announced their own (see hsMsg.Caps)
+	}
 	b2, _ := json.Marshal(m2)
 	th1 := thash(b1, b2)
 	pk, err := ecdh.X25519().NewPublicKey(m1.Eph)
 	if err != nil {
-		return nil, nil, err
+		return nil, res, err
 	}
 	dh, err := eph.ECDH(pk)
 	if err != nil {
-		return nil, nil, err
+		return nil, res, err
 	}
 	var pakeK []byte
 	if sp != nil {
 		if pakeK, err = sp.finish(m1.Pake); err != nil {
 			p.pairResult(false, nil)
-			return nil, nil, err
+			return nil, res, err
 		}
 	}
 	k := deriveKeys(dh, pakeK, th1)
@@ -252,7 +349,7 @@ func serverHandshake(c net.Conn, r io.Reader, p responderPolicy, b1 []byte, m1 h
 		m2.MAC = mac(k.confirm, "device", th1)
 	}
 	if _, err := writeMsg(c, m2); err != nil {
-		return nil, nil, err
+		return nil, res, err
 	}
 	var m3 hsMsg
 	_, err = readMsg(r, &m3)
@@ -262,12 +359,20 @@ func serverHandshake(c net.Conn, r io.Reader, p responderPolicy, b1 []byte, m1 h
 		ok = ok && hmac.Equal(m3.MAC, mac(k.confirm, "desktop", th2))
 		p.pairResult(ok, peerID)
 	}
+	var meta handshakeMeta
+	if ok {
+		if meta, err = openMeta(k, m3.Meta); err != nil {
+			ok = false
+		}
+	}
 	if !ok {
 		writeMsg(c, hsMsg{Err: "handshake failed"})
-		return nil, nil, errors.New("peer failed to authenticate")
+		return nil, res, errors.New("peer failed to authenticate")
 	}
 	if _, err := writeMsg(c, hsMsg{Mode: "ok"}); err != nil {
-		return nil, nil, err
+		return nil, res, err
 	}
-	return makeSecure(c, r, k, false), peerID, nil
+	sc := makeSecure(c, r, k, false)
+	sc.peerCaps = m1.Caps
+	return sc, handshakeResult{peer: peerID, token: m1.Token, caps: m1.Caps, meta: meta}, nil
 }

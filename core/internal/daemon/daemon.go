@@ -42,6 +42,11 @@ const (
 	CodeBlocked        = -32018
 	CodeNoSession      = -32020
 	CodeAuditDisabled  = -32021
+	CodeCancelled      = -32022
+	CodeADBPairFailed  = -32023
+	CodeUnsupported    = -32024
+	CodeSessionExpired = -32025
+	CodePeerClosed     = -32026
 )
 
 // Error is a JSON-RPC error object. Data.kind names the sentinel.
@@ -58,6 +63,10 @@ var sentinels = []struct {
 	code int
 	kind string
 }{
+	{genadb.ErrSessionExpired, CodeSessionExpired, "session_expired"},
+	{genadb.ErrPeerClosed, CodePeerClosed, "peer_closed"},
+	{genadb.ErrUnsupported, CodeUnsupported, "unsupported"},
+	{genadb.ErrADBPairFailed, CodeADBPairFailed, "adb_pair_failed"},
 	{genadb.ErrBadCode, CodeBadCode, "bad_code"},
 	{genadb.ErrNotPaired, CodeNotPaired, "not_paired"},
 	{genadb.ErrRevoked, CodeRevoked, "revoked"},
@@ -368,6 +377,28 @@ func (s *Server) call(ctx context.Context, c *conn, req request) (any, error) {
 			return nil, err
 		}
 		return info(sess), nil
+
+	case "session.pair_adb":
+		var p struct {
+			DeviceID    string `json:"device_id"`
+			PairingPort int    `json:"pairing_port"`
+			PairingCode string `json:"pairing_code"`
+			ADBPath     string `json:"adb_path"`
+			TimeoutMS   int    `json:"timeout_ms"`
+		}
+		if err := decode(req.Params, &p); err != nil {
+			return nil, err
+		}
+		if p.DeviceID == "" || p.PairingCode == "" {
+			return nil, &Error{Code: CodeInvalidParams, Message: "device_id and pairing_code are required"}
+		}
+		if p.TimeoutMS <= 0 {
+			p.TimeoutMS = 60000
+		}
+		cctx, cancel := context.WithTimeout(ctx, time.Duration(p.TimeoutMS)*time.Millisecond)
+		defer cancel()
+		return cl.PairADB(cctx, genadb.PairADBRequest{DeviceID: p.DeviceID, PairingPort: p.PairingPort,
+			PairingCode: p.PairingCode, ADBPath: p.ADBPath})
 
 	case "session.list":
 		out := []SessionInfo{}

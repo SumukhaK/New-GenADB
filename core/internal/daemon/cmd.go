@@ -50,6 +50,8 @@ func run(name string, args []string) error {
 	hookURL := fl.String("audit-webhook-url", "", "also POST signed audit records here")
 	hookSecretFile := fl.String("audit-webhook-secret-file", "", "webhook HMAC secret file (default $GENADB_AUDIT_WEBHOOK_SECRET)")
 	anchorKey := fl.String("audit-anchor-key-file", "", "key that signs the audit log's anchor (default: audit-anchor.key next to the log)")
+	adbPath := fl.String("adb", "", "adb executable for session.pair_adb (default: adb on PATH)")
+	label := fl.String("label", "", "name shown for this computer in the phone's session list (default: none)")
 	var t genadb.TransportOptions
 	fl.StringVar(&t.Proxy, "proxy", "", "HTTP proxy for ws/wss relays")
 	fl.StringVar(&t.CAFile, "relay-ca", "", "PEM CA/certificate to trust for wss relays")
@@ -61,6 +63,12 @@ func run(name string, args []string) error {
 		genadb.WithEventHandler(srv.Publish), genadb.WithLogger(func(l string) { fmt.Fprintln(os.Stderr, l) })}
 	if *state != "" {
 		opts = append(opts, genadb.WithStateDir(*state))
+	}
+	if *adbPath != "" {
+		opts = append(opts, genadb.WithADBPath(*adbPath))
+	}
+	if *label != "" {
+		opts = append(opts, genadb.WithDeviceLabel(*label))
 	}
 	ac := genadb.AuditConfig{Path: *auditLog, WebhookURL: *hookURL, AnchorKeyFile: *anchorKey}
 	switch *auditMode {

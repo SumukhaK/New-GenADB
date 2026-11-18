@@ -23,11 +23,13 @@ func Main(name string, args []string) int {
 			return cmdAudit(args[1:])
 		case "doctor":
 			return cmdDoctor(args[1:])
+		case "adb-pair":
+			return cmdADBPair(args[1:])
 		case "version", "--version":
 			fmt.Println(engine.Version)
 			return 0
 		case "help", "-h", "--help":
-			fmt.Printf("usage: %s <relay|device|connect|keygen|doctor|audit|version> [flags]\n", prog)
+			fmt.Printf("usage: %s <relay|device|connect|adb-pair|keygen|doctor|audit|version> [flags]\n", prog)
 			return 0
 		}
 	}

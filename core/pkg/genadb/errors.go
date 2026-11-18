@@ -23,6 +23,17 @@ var (
 	ErrNoGrant = engine.ErrNoGrant
 	// ErrBlocked: device management disallows debugging on the device.
 	ErrBlocked = engine.ErrBlocked
+	// ErrUnsupported: the device runs an agent without this capability
+	// (for example adb pairing needs Setu-SDK 1.1.0 on the phone).
+	ErrUnsupported = engine.ErrUnsupported
+	// ErrADBPairFailed: adb pair through the bridge did not succeed.
+	ErrADBPairFailed = engine.ErrADBPairFailed
+	// ErrSessionExpired: the corporate max_session_seconds cap ended the
+	// session. It is not retried: Connect again to re-authenticate.
+	ErrSessionExpired = engine.ErrSessionExpired
+	// ErrPeerClosed: the device ended the session on purpose (for example
+	// SetuManager.endSession on the phone). It is not retried.
+	ErrPeerClosed = engine.ErrPeerClosed
 )
 
 // Errors raised by the Client itself.

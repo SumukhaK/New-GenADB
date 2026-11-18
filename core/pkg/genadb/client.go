@@ -430,46 +430,55 @@ func (s *SetuSession) run(ctx context.Context, req ConnectRequest) {
 	}
 }
 
-func (s *SetuSession) runOnce(ctx context.Context, req ConnectRequest, code string) error {
+// desktopConfig is the engine configuration shared by sessions and PairADB.
+func (c *SetuClient) desktopConfig(ctx context.Context, deviceID string) (engine.DesktopConfig, error) {
 	cfg := engine.DesktopConfig{
-		Relay:  s.c.cfg.relay,
-		State:  s.c.cfg.state,
-		Listen: req.Listen,
-		Mode:   string(s.c.cfg.mode),
-		Code:   code,
-		Device: req.DeviceID,
-		Dial:   engine.Dialer(s.c.cfg.transport.Dial),
-		Audit:  s.c.sink,
-		Events: func(ev string, f map[string]any) {
-			switch ev {
-			case "paired", "listening":
-				s.mu.Lock()
-				if d, ok := f["device_id"].(string); ok && d != "" {
-					s.deviceID = d
-				}
-				if a, ok := f["addr"].(string); ok && ev == "listening" {
-					s.addr = a
-				}
-				s.mu.Unlock()
-			}
-			s.c.emit(Event{Type: ev, Session: s.id, Fields: f})
-			if ev == "listening" {
-				s.readyOnce.Do(func() { close(s.ready) })
-			}
-		},
+		Relay:  c.cfg.relay,
+		State:  c.cfg.state,
+		Mode:   string(c.cfg.mode),
+		Device: deviceID,
+		Dial:   engine.Dialer(c.cfg.transport.Dial),
+		Audit:  c.sink,
+		Label:  c.cfg.label,
 	}
-	if s.c.cfg.mode == ModeCorporate {
-		tok, err := s.c.cfg.auth.Token(ctx)
+	if c.cfg.mode == ModeCorporate {
+		tok, err := c.cfg.auth.Token(ctx)
 		if err != nil {
-			return fmt.Errorf("%w: %w", ErrTokenInvalid, err)
+			return cfg, fmt.Errorf("%w: %w", ErrTokenInvalid, err)
 		}
-		cfg.Identity, cfg.PolicyPath = tok, s.c.cfg.policyPath
+		cfg.Identity, cfg.PolicyPath = tok, c.cfg.policyPath
+	}
+	return cfg, nil
+}
+
+func (s *SetuSession) runOnce(ctx context.Context, req ConnectRequest, code string) error {
+	cfg, err := s.c.desktopConfig(ctx, req.DeviceID)
+	if err != nil {
+		return err
+	}
+	cfg.Listen, cfg.Code = req.Listen, code
+	cfg.Events = func(ev string, f map[string]any) {
+		switch ev {
+		case "paired", "listening":
+			s.mu.Lock()
+			if d, ok := f["device_id"].(string); ok && d != "" {
+				s.deviceID = d
+			}
+			if a, ok := f["addr"].(string); ok && ev == "listening" {
+				s.addr = a
+			}
+			s.mu.Unlock()
+		}
+		s.c.emit(Event{Type: ev, Session: s.id, Fields: f})
+		if ev == "listening" {
+			s.readyOnce.Do(func() { close(s.ready) })
+		}
 	}
 	// Reuse the address a restarted session listened on, so IDEs keep working.
 	if a := s.ADBAddr(); a != "" {
 		cfg.Listen = a
 	}
-	err := engine.RunDesktop(ctx, cfg)
+	err = engine.RunDesktop(ctx, cfg)
 	if errors.Is(err, context.Canceled) && ctx.Err() == nil {
 		err = fmt.Errorf("%w: session ended", ErrUnavailable)
 	}
