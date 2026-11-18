@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
@@ -38,11 +39,13 @@ internal class ManagerCore(
     private val _policy = MutableStateFlow(PolicyStatus())
     private val _lastAudit = MutableStateFlow<AuditEvent?>(null)
     private val _recentAudit = MutableStateFlow<List<AuditEvent>>(emptyList())
+    private val _sessions = MutableStateFlow<List<DeviceSession>>(emptyList())
 
     val connectionState: StateFlow<ConnectionState> = _connection.asStateFlow()
     val policyStatus: StateFlow<PolicyStatus> = _policy.asStateFlow()
     val lastAuditEvent: StateFlow<AuditEvent?> = _lastAudit.asStateFlow()
     val recentAuditEvents: StateFlow<List<AuditEvent>> = _recentAudit.asStateFlow()
+    val sessions: StateFlow<List<DeviceSession>> = _sessions.asStateFlow()
 
     private val lock = Any()
     private var job: Job? = null
@@ -103,6 +106,7 @@ internal class ManagerCore(
         proc?.destroy()
         proc = null
         if (record) recordAudit("agent_stop", emptyMap())
+        _sessions.value = emptyList()
         if (auditSinkOverride == null) audit?.close()
         audit = null
         _connection.value = ConnectionState.Idle
@@ -132,11 +136,25 @@ internal class ManagerCore(
         }
     }
 
+    /**
+     * Ends one open session from the phone: the agent closes it, tells the
+     * desktop (which ends its session instead of rejoining) and reports
+     * session_close with reason ended_on_device. False when no such session
+     * is open or the agent cannot take commands.
+     */
+    fun endSession(id: String): Boolean {
+        val p = synchronized(lock) { proc } ?: return false
+        if (_sessions.value.none { it.id == id }) return false
+        val sent = p.writeLine(endSessionCommand(id))
+        if (sent) recordAudit("session_end_requested", mapOf("session_id" to id))
+        return sent
+    }
+
     private fun recordAudit(type: String, fields: Map<String, String>) {
         val sink = audit ?: return
         val ev = runCatching { sink.record(type, deviceId, fields) }.getOrNull() ?: return
         _lastAudit.value = ev
-        _recentAudit.value = (_recentAudit.value + ev).takeLast(RECENT_AUDIT)
+        _recentAudit.update { (it + ev).takeLast(RECENT_AUDIT) }
     }
 
     private suspend fun supervise(eff: EffectiveConfig) {
@@ -163,13 +181,16 @@ internal class ManagerCore(
                     val ev = AgentEvent.parse(line) ?: continue
                     view = view.reduce(ev)
                     if (view.deviceId != null) deviceId = view.deviceId
+                    // Audit first, so anyone reacting to a session change finds its record.
                     auditFor(ev)?.let { (t, f) -> recordAudit(t, f) }
+                    _sessions.value = _sessions.value.apply(ev, System.currentTimeMillis())
                     if (ev is AgentEvent.Online) {
                         delayMs = backoff.initialMs
                         attempt = 0
                     }
                     if (currentJobActive()) _connection.value = view.state()
                 }
+                _sessions.value = emptyList() // the agent's sessions ended with it
                 val code = runInterruptible { p.waitFor() }
                 lastError = view.lastError ?: "agent exited with code $code"
                 recordAudit("agent_exit", mapOf("exit_code" to code.toString()))

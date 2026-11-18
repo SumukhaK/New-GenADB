@@ -5,14 +5,18 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,7 +55,7 @@ func (d *deviceAgent) serveLAN(ln net.Listener) {
 		if tc, ok := c.(*net.TCPConn); ok {
 			tc.SetNoDelay(true)
 		}
-		go d.serveStream(c)
+		go d.serveStream(c, "lan")
 	}
 }
 
@@ -69,7 +73,20 @@ type DeviceConfig struct {
 	Transport    TransportOptions // relay transport options
 	Dial         Dialer           // overrides the relay dialer
 	Events       EventFunc        // receives events; nil = discard
+	// Commands (v1.1.0+) lets the host app act on live sessions, e.g. end
+	// one from the phone. nil = no commands.
+	Commands <-chan DeviceCommand
 }
+
+// DeviceCommand is a request from the app hosting the device agent.
+type DeviceCommand struct {
+	Op        string     // "end_session"
+	SessionID string     // the session_id from session_open
+	Reply     chan error // optional; receives the outcome
+}
+
+// ErrNoSuchSession: a command named a session that is not open.
+var ErrNoSuchSession = errors.New("no such session")
 
 // RunDevice registers the device with the relay and serves tunnels to adbd
 // until ctx is cancelled. When debugging is disallowed it emits "blocked" and
@@ -112,6 +129,7 @@ func RunDevice(ctx context.Context, cfg DeviceConfig) error {
 		if d.pol, err = loadPolicy(cfg.PolicyPath); err != nil {
 			return err
 		}
+		d.pol.scopedTo(id) // the phone needs nothing about other devices
 		if _, err := d.pol.verifyToken(cfg.Enroll, "device", key.Public().(ed25519.PublicKey)); err != nil {
 			return fmt.Errorf("enrollment token: %w", err)
 		}
@@ -143,6 +161,9 @@ func RunDevice(ctx context.Context, cfg DeviceConfig) error {
 		}
 		d.mu.Unlock()
 	})()
+	if cfg.Commands != nil {
+		go d.serveCommands(ctx, cfg.Commands)
+	}
 	announced := false
 	// Reconnect quickly after a session that was up for a while (a relay
 	// restart), back off to 5 s once the network has been down for ~10 s, and log only
@@ -295,14 +316,16 @@ func (d *deviceAgent) openData(sid string) {
 		c.Close()
 		return
 	}
-	d.serveStream(c)
+	d.serveStream(c, TransportLabel(d.relayAddr))
 }
 
 // handshakeSlots bounds concurrent unauthenticated handshakes so a flood of
 // session opens cannot exhaust the phone.
 var handshakeSlots = make(chan struct{}, 16)
 
-func (d *deviceAgent) serveStream(c net.Conn) {
+// serveStream authenticates one stream (transport: lan or a relay label)
+// and serves it: a new tunnel to adbd, an adb pairing stream, or a rejoin.
+func (d *deviceAgent) serveStream(c net.Conn, transport string) {
 	select {
 	case handshakeSlots <- struct{}{}:
 	default:
@@ -329,15 +352,30 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		var rj rejoinMsg
 		if json.Unmarshal(b1, &rj) != nil {
 			c.Close()
-		} else if err := serverRejoin(c, c, rj, d.lookupTunnel); err != nil {
+		} else if err := serverRejoin(c, c, rj, d.lookupTunnel, transport); err != nil {
 			logf("rejoin refused: %v", err)
 			c.Close()
 		}
 		return
 	}
-	sc, _, err := serverHandshake(c, c, d.policy(), b1, m1)
+	sc, hs, err := serverHandshake(c, c, d.policy(), b1, m1)
 	if err != nil {
 		logf("handshake failed: %v", err)
+		c.Close()
+		return
+	}
+	if hs.meta.Target == "probe" {
+		// The desktop only checked that we answer and trust it.
+		c.Close()
+		return
+	}
+	if strings.HasPrefix(hs.meta.Target, "adb-pair:") {
+		release()
+		d.servePairing(sc, hs, transport)
+		return
+	}
+	if hs.meta.Target != "" {
+		logf("unknown stream target %q", hs.meta.Target)
 		c.Close()
 		return
 	}
@@ -349,7 +387,89 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 		return
 	}
 	release()
-	t := newTunnel(sc, accelerate(a), false)
+	d.runTunnel(newTunnel(sc, accelerate(a), false), transport, "adb", d.peerLabel(hs))
+}
+
+// serveCommands applies host-app commands until ctx ends.
+func (d *deviceAgent) serveCommands(ctx context.Context, cmds <-chan DeviceCommand) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case c, ok := <-cmds:
+			if !ok {
+				return
+			}
+			var err error
+			switch c.Op {
+			case "end_session":
+				err = d.endSession(c.SessionID)
+			default:
+				err = fmt.Errorf("unknown command %q", c.Op)
+			}
+			if c.Reply != nil {
+				c.Reply <- err
+			}
+		}
+	}
+}
+
+// endSession closes one session from the phone: the desktop is told
+// (ended_on_device), ends its session instead of rejoining, and the stream
+// cannot be resumed.
+func (d *deviceAgent) endSession(id string) error {
+	d.mu.Lock()
+	var hit *tunnel
+	for _, t := range d.tunnels {
+		if t.ID() == id {
+			hit = t
+		}
+	}
+	d.mu.Unlock()
+	if hit == nil {
+		return fmt.Errorf("%w: %q", ErrNoSuchSession, id)
+	}
+	logf("session %s ended on the device", id)
+	hit.closeWith("ended_on_device")
+	return nil
+}
+
+// peerLabel names the desktop in the phone's session list: the label it
+// sent (sealed in the handshake), else the corporate user, else a short
+// fingerprint of its key.
+func (d *deviceAgent) peerLabel(hs handshakeResult) string {
+	if l := cleanReason([]byte(hs.meta.Label)); l != "" {
+		return l // untrusted text from an authenticated peer: printable, bounded
+	}
+	if d.mode == "corporate" && d.pol != nil && hs.token != "" {
+		if cl, err := d.pol.verifyToken(hs.token, "user", hs.peer); err == nil {
+			return cl.Sub
+		}
+	}
+	if len(hs.peer) > 0 {
+		sum := sha256.Sum256(hs.peer)
+		return "desktop-" + hex.EncodeToString(sum[:4])
+	}
+	return "desktop"
+}
+
+func (d *deviceAgent) runTunnel(t *tunnel, transport, kind, label string) {
+	t.observe(transport, d.events)
+	d.events("session_open", map[string]any{"session_id": t.ID(), "peer_label": label, "transport": transport, "kind": kind})
+	defer func() {
+		d.events("session_close", map[string]any{"session_id": t.ID(), "reason": t.endReason()})
+	}()
+	if d.mode == "corporate" && d.pol != nil && d.pol.MaxSessionSeconds > 0 {
+		// Hard cap, enforced here because the device is the party that must
+		// not be talked into more: the tunnel is closed (and can no longer be
+		// rejoined) once it is max_session_seconds old, whatever the desktop
+		// does. A new stream needs a full, token-checked handshake.
+		tm := time.AfterFunc(time.Duration(d.pol.MaxSessionSeconds)*time.Second, func() {
+			logf("session %s reached max_session_seconds", t.ID())
+			t.closeWith("session_expired")
+		})
+		defer tm.Stop()
+	}
 	key := hex.EncodeToString(t.sid)
 	d.mu.Lock()
 	d.tunnels[key] = t
@@ -359,6 +479,84 @@ func (d *deviceAgent) serveStream(c net.Conn) {
 	delete(d.tunnels, key)
 	d.mu.Unlock()
 }
+
+// servePairing carries an Android 11+ Wireless-debugging pairing exchange
+// (adb pair, _adb-tls-pairing._tcp) from an authenticated desktop to the
+// pairing service on this phone. The pairing code itself never reaches us:
+// adb on the desktop and adbd run their own SPAKE2 exchange inside our
+// end-to-end encrypted tunnel.
+func (d *deviceAgent) servePairing(sc *secureConn, hs handshakeResult, transport string) {
+	port, err := strconv.Atoi(strings.TrimPrefix(hs.meta.Target, "adb-pair:"))
+	if err != nil || port < 0 || port > 65535 {
+		sc.Close()
+		return
+	}
+	pc, addr, err := d.dialPairing(port)
+	if err != nil {
+		logf("adb pairing service unreachable: %v", err)
+		d.events("adb_pair_unreachable", map[string]any{"port": port, "reason": err.Error()})
+		t := newTunnel(sc, &nopConn{}, false)
+		t.closeWith("pairing service unreachable: open Wireless debugging > Pair device with pairing code on the phone")
+		return
+	}
+	d.events("adb_pair_open", map[string]any{"addr": addr})
+	d.runTunnel(newTunnel(sc, pc, false), transport, "adb-pair", d.peerLabel(hs))
+	d.events("adb_pair_closed", map[string]any{"addr": addr})
+}
+
+// dialPairing finds the Wireless-debugging pairing service. port is what the
+// phone's "Pair device with pairing code" dialog shows (0 = discover it).
+func (d *deviceAgent) dialPairing(port int) (net.Conn, string, error) {
+	var cands []string
+	if port > 0 {
+		if a, err := d.adbd.current(); err == nil {
+			if h, _, err := net.SplitHostPort(a); err == nil {
+				cands = append(cands, net.JoinHostPort(h, strconv.Itoa(port)))
+			}
+		}
+		if lo := net.JoinHostPort("127.0.0.1", strconv.Itoa(port)); len(cands) == 0 || cands[0] != lo {
+			cands = append(cands, lo)
+		}
+	}
+	var last error = fmt.Errorf("no pairing service advertised")
+	for _, a := range cands {
+		c, err := dialTimeout(a, adbdDialTimeout)
+		if err == nil {
+			return c, a, nil
+		}
+		last = err
+	}
+	if pairingBrowse == nil {
+		return nil, "", last
+	}
+	eps, err := pairingBrowse()
+	if err != nil && len(eps) == 0 {
+		return nil, "", fmt.Errorf("%v; mDNS: %v", last, err)
+	}
+	for _, ep := range eps {
+		if _, p, _ := net.SplitHostPort(ep); port > 0 && p != strconv.Itoa(port) {
+			continue
+		}
+		if c, err := dialTimeout(ep, adbdDialTimeout); err == nil {
+			return c, ep, nil
+		} else {
+			last = err
+		}
+	}
+	return nil, "", last
+}
+
+// pairingBrowse discovers _adb-tls-pairing._tcp endpoints (overridable in tests).
+var pairingBrowse = func() ([]string, error) {
+	return browse("_adb-tls-pairing._tcp.local.", 1500*time.Millisecond)
+}
+
+// nopConn stands in for the local side of a tunnel that is closed at once.
+type nopConn struct{ net.Conn }
+
+func (*nopConn) Read([]byte) (int, error)    { return 0, io.EOF }
+func (*nopConn) Write(b []byte) (int, error) { return len(b), nil }
+func (*nopConn) Close() error                { return nil }
 
 func (d *deviceAgent) lookupTunnel(sid string) *tunnel {
 	d.mu.Lock()

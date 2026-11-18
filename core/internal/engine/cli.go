@@ -1,10 +1,13 @@
 package engine
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -64,7 +67,7 @@ func cliRelay(ctx context.Context, args []string) error {
 	fs.StringVar(&c.PolicyPath, "policy", "", "policy file (corporate)")
 	fs.StringVar(&c.AuditPath, "audit", "", "hash-chained audit log path (JSONL); corporate default <state>/relay-audit.jsonl, and cannot be turned off")
 	fs.StringVar(&c.AuditKeyFile, "audit-anchor-key-file", "", "key that signs the audit log's anchor (default: audit-anchor.key next to the log)")
-	state := fs.String("state", ".", "directory for the relay's default audit log")
+	state := fs.String("state", ".", "directory for the relay's persisted revocations (revocations.json) and default audit log")
 	fs.StringVar(&c.AdminListen, "admin", "", "admin listen address")
 	fs.StringVar(&c.AdminToken, "admin-token", "", "admin bearer token")
 	fs.StringVar(&c.WSListen, "ws-listen", "", "also accept clients over WebSocket on this address (ws://, or wss:// with --tls-cert)")
@@ -89,6 +92,7 @@ func cliRelay(ctx context.Context, args []string) error {
 	if c.AuditPath != "" {
 		logf("audit log: %s", c.AuditPath)
 	}
+	c.StateDir = *state // revocations.json survives restarts
 	c.Events = StdoutEvents
 	return RunRelay(ctx, c)
 }
@@ -107,12 +111,47 @@ func cliDevice(ctx context.Context, args []string) error {
 	AddTransportFlags(fs, &c.Transport)
 	fs.StringVar(&c.LANListen, "lan-listen", "", "LAN listen address (solo: direct path)")
 	fs.StringVar(&c.LANAdvertise, "lan-advertise", "", "LAN address to advertise (default: lan-listen)")
+	control := fs.Bool("control-stdin", false, `read JSON commands from stdin, one per line: {"cmd":"end_session","session_id":"..."}`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	c.DebugAllowed = *debugPolicy == "allowed"
 	c.Events = StdoutEvents
+	if *control {
+		c.Commands = readCommands(ctx, os.Stdin, StdoutEvents)
+	}
 	return RunDevice(ctx, c)
+}
+
+// readCommands turns JSON lines from r into device commands and reports
+// each outcome as a command_result event.
+func readCommands(ctx context.Context, r io.Reader, events EventFunc) <-chan DeviceCommand {
+	out := make(chan DeviceCommand)
+	go func() {
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			var m struct {
+				Cmd       string `json:"cmd"`
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal(sc.Bytes(), &m) != nil || m.Cmd == "" {
+				continue
+			}
+			reply := make(chan error, 1)
+			select {
+			case out <- DeviceCommand{Op: m.Cmd, SessionID: m.SessionID, Reply: reply}:
+			case <-ctx.Done():
+				return
+			}
+			err := <-reply
+			f := map[string]any{"cmd": m.Cmd, "session_id": m.SessionID, "ok": err == nil}
+			if err != nil {
+				f["error"] = err.Error()
+			}
+			events("command_result", f)
+		}
+	}()
+	return out
 }
 
 func cliConnect(ctx context.Context, args []string) error {
@@ -125,6 +164,7 @@ func cliConnect(ctx context.Context, args []string) error {
 	AddTransportFlags(fs, &c.Transport)
 	fs.StringVar(&c.Code, "code", "", "pairing code shown on the phone (NNNN-SSSSSS)")
 	fs.StringVar(&c.Device, "device", "", "previously paired device id")
+	fs.StringVar(&c.Label, "label", "", "name shown for this computer in the phone's session list (v1.1.0)")
 	fs.StringVar(&c.Identity, "identity", "", "user identity JWT (corporate)")
 	fs.StringVar(&c.PolicyPath, "policy", "", "policy file (corporate)")
 	auditPath := fs.String("audit", "", "record sessions and adb operations to this hash-chained JSONL file; corporate default <state>/audit.jsonl, and cannot be turned off")

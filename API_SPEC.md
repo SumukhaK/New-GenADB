@@ -1,15 +1,31 @@
 # Setu (Setu-SDK) API specification
 
-Version 1.0.1. Setu is an encrypted bridge between your IDE and any Android device, anywhere. This document is the contract for front ends, including the separate `genadb-ui` repository, IDE plugins and device-lab tooling. It covers four surfaces:
+Version 1.1.0. Setu is an encrypted bridge between your IDE and any Android device, anywhere. This document is the contract for front ends, including the separate `genadb-ui` repository, IDE plugins and device-lab tooling. It covers four surfaces:
 
 1. [Go SDK](#1-go-sdk-pkggenadb): `github.com/sumukhak/new-genadb/core/pkg/genadb`
 2. [Daemon JSON-RPC protocol](#2-daemon-json-rpc-20-protocol): `setu-daemon`
 3. [Audit record and report schema](#3-audit-record-and-report-schema)
 4. [Android SDK](#4-android-sdk-setu-android): `dev.genadb.sdk.SetuManager`
+5. [Relay admin API and corporate policy](#5-relay-admin-api-and-corporate-policy)
+
+**Go module path.** The module is declared in `core/go.mod` as `github.com/sumukhak/new-genadb/core`, and the import path stays that way across the Setu rename: `import "github.com/sumukhak/new-genadb/core/pkg/genadb"`. The GitHub repository has since moved (old URLs redirect), but Go resolves the module by the path in `go.mod`, so do not rewrite the import to the new repository name. Within this repository, consume it with a `replace` directive or a `go.work` file pointing at `core/`.
 
 The CLI's JSON-lines events (`setu device` and `setu connect` print one JSON object per line on stdout) use the same event names as section 1.4.
 
-Compatibility: within 0.x, fields and methods may be added, never renamed or removed without a minor version bump. Clients must ignore unknown fields and event types.
+Compatibility: within 1.x, fields, methods and events may be added, never renamed or removed. Clients must ignore unknown fields and event types.
+
+**New in 1.1.0** (all backward compatible; a 1.1 peer talking to a 1.0 peer falls back to 1.0 behaviour, and the new features report `ErrUnsupported`):
+
+| Area | Addition | Section |
+|---|---|---|
+| Android 11+ pairing | `SetuClient.PairADB`, daemon `session.pair_adb`, `setu adb-pair`: tunnel `adb pair` (`_adb-tls-pairing._tcp`) to the phone | 1.1, 2.1 |
+| Token rotation | `SetuClient.SetToken`, `WatchIdentityFile`, daemon `auth.set_token` and an automatic identity-file watch: no restart, no dropped session | 1.1, 2.1 |
+| Daemon | Concurrent request dispatch, `session.cancel`, the `daemon_ready` stdout line, the `events.dropped` notification | 2 |
+| Relay | Revocations persisted in the relay's `--state` directory; `GET /v1/devices` presence, `devices.presence` | 5 |
+| Path events | `path_down`, `path_up`, `path_lost` on the Go SDK, the CLI and `ConnectionState.Online.path` on Android | 1.5, 4 |
+| Corporate | `max_session_seconds` is a hard cap that requires re-authentication; `policy_json` is scoped per device | 1.6, 5 |
+| Device sessions | `session_open` / `session_close` with `peer_label` and `transport`; `SetuManager.sessions`; `SetuManager.endSession(id)` sends a graceful `peer_closed` | 1.5, 4 |
+| Lock screen | The pairing code is never shown on the lock screen (`SetuNotifications`) | 4.4 |
 
 ---
 
@@ -40,6 +56,11 @@ func (c *SetuClient) PublicKey() (string, error)                 // identity key
 func (c *SetuClient) ExportAuditReport(w io.Writer, f audit.Format, opt audit.Options) error
 func (c *SetuClient) Doctor(ctx context.Context) DoctorReport
 func (c *SetuClient) HostDevice(ctx context.Context, h HostConfig) error   // device side
+func (c *SetuClient) PairADB(ctx context.Context, req PairADBRequest) (*PairADBResult, error)  // 1.1.0
+func (c *SetuClient) SetToken(token string) (TokenInfo, error)                                // 1.1.0, corporate
+func (c *SetuClient) WatchIdentityFile(ctx context.Context, path string, every time.Duration) // 1.1.0, corporate
+func (c *SetuClient) Presence(ctx context.Context) ([]DevicePresence, error)                  // 1.1.0, corporate
+func (c *SetuClient) DroppedEvents() uint64                      // events lost because Events() was full
 func (c *SetuClient) Events() <-chan Event
 func (c *SetuClient) Mode() Mode
 func (c *SetuClient) StateDir() string
@@ -52,10 +73,25 @@ func (c *SetuClient) Close() error                               // stops sessio
 | Field | Meaning |
 |---|---|
 | `DeviceID` | A paired (solo) or granted (corporate) device |
-| `PairingCode` | The code shown on the phone, `NNNN-XXXXXX`. Pairs first, then connects (solo only) |
+| `PairingCode` | The code shown on the phone, `NNNN-NNNNNN` (10 digits: a 4-digit nameplate and a 6-digit secret). Pairs first, then connects (solo only) |
 | `Listen` | Local adb endpoint. The default is `127.0.0.1:0`, which picks any free port |
 
 `Connect` returns once the local endpoint is listening, or with the first error; it never retries before the session is up. A mistyped, expired or burned pairing code fails fast with `ErrBadCode`, and a relay that does not answer within 20 s fails with `ErrUnavailable`. If `ctx` ends first, the error wraps `ctx.Err()` and the last session error.
+
+`PairADB` (1.1.0) pairs this computer's adb with a phone on Android 11+ Wireless debugging, through the same encrypted tunnel, so a later `adb connect` to the session address is accepted by the phone's TLS adbd. On the phone, open *Settings > Developer options > Wireless debugging > Pair device with pairing code*; that dialog shows a port and a six-digit code.
+
+| `PairADBRequest` field | Meaning |
+|---|---|
+| `DeviceID` | A paired (solo) or granted (corporate) device; the tunnel to it must be possible |
+| `PairingPort` | The port in the phone's dialog. `0` asks the phone to discover its own `_adb-tls-pairing._tcp` service |
+| `PairingCode` | The six-digit Wi-Fi pairing code. It is passed to the local `adb pair` only, and travels to the phone inside adb's own SPAKE2 exchange, which the tunnel also encrypts |
+| `ADBPath` | adb executable for this call (default: `WithADBPath`, else `adb` on `PATH`) |
+
+The result is `PairADBResult{DeviceID, Paired, Transport, Output}` (`transport` is `lan`, `relay-tcp`, `relay-ws` or `relay-wss`). Errors: `ErrADBPairFailed` (adb rejected the code, or nothing answered on the port), `ErrUnsupported` (the device runs a 1.0 agent), and the usual denials. An `adb_pair` event reports the outcome either way.
+
+`SetToken` (1.1.0, corporate) verifies a new identity token (signature, issuer, audience, expiry, type and binding to this machine's key) and, if it passes, uses it for every later stream, rejoin and reconnect of every live session. Nothing restarts and no session drops. A rejected token leaves the current one in place. While sessions are live, the new token must name the same subject; switching users requires stopping the sessions first. It returns `TokenInfo{Subject, TokenID, ExpiresAt}`, writes a `token_rotated` audit record and emits `token_updated`. `WatchIdentityFile` polls a file (the daemon's `--identity-file` uses it) and calls `SetToken` whenever its contents change, so an external token refresher only has to rewrite the file; a rejected token is reported as an `error` event and the old token stays.
+
+`Presence` (1.1.0, corporate) lists the devices the policy grants this user, with live state from the relay: `DevicePresence{DeviceID, Online, ConnectedAt, Transport, Sessions}`. `Transport` is how the device reaches the relay (`tcp`, `ws` or `wss`). Granted devices that are revoked are reported offline.
 
 ### 1.2 SetuSession
 
@@ -86,7 +122,10 @@ When a session is restarted under its reconnect policy, it keeps the same `ADBAd
 | `WithTransport(TransportProvider)` | built-in | Replaces the relay dialer |
 | `WithDeviceDiscoverer(DeviceDiscoverer)` | paired devices in the state directory | |
 | `WithEventHandler(func(Event))` | none | Synchronous, lossless; must not block |
-| `WithEventBuffer(n)` | 256 | Capacity of `Events()`. Events are dropped when it is full |
+| `WithEventBuffer(n)` | 256 | Capacity of `Events()`. Events are dropped when it is full; `DroppedEvents()` counts them. Audit records are never dropped from the log |
+| `WithDeviceLabel(label)` | none | 1.1.0. Name shown for this computer in the phone's session list (`peer_label`). Sanitised to 64 printable characters |
+| `WithADBPath(path)` | `adb` on `PATH` | 1.1.0. adb used by `PairADB` |
+| `WithADBPairer(ADBPairer)` | `ExecADBPair` | 1.1.0. Replaces the `adb pair` invocation (tests, embedded adb) |
 | `WithLogger(func(string))` | stderr | Process-wide |
 
 `AuditConfig`:
@@ -133,13 +172,27 @@ type Event struct {
 | `session_up` | `addr`, `device_id` | `Connect` returned |
 | `retrying` | `attempt`, `error`, `delay_ms` | A session is being restarted |
 | `session_down` | `error` (if abnormal) | A session ended |
+| `path_down` | `session_id`, `reason`, `transport` | 1.1.0. A tunnel's path broke (keepalive timeout, reset, peer reconnected) and it is rejoining. adb connections stay open |
+| `path_up` | `session_id`, `transport`, `outage_ms` | 1.1.0. The tunnel rejoined, possibly over another transport (for example `relay-wss` to `lan`) |
+| `path_lost` | `session_id`, `reason`, `outage_ms` | 1.1.0. The rejoin window (90 s) expired; that adb connection is closed |
+| `session_expired` | `device_id`, `reason` | 1.1.0, corporate. `max_session_seconds` was reached; the session ends with `ErrSessionExpired` |
+| `peer_closed` | `device_id`, `peer_reason` | 1.1.0. The device ended the session (for example `ended_on_device` from `SetuManager.endSession`); it ends with `ErrPeerClosed` and is not retried |
+| `token_updated` | `subject`, `token_id`, `expires_at` | 1.1.0. `SetToken` accepted a token |
+| `adb_pair` | `device_id`, `paired`, `transport` or `error` | 1.1.0. `PairADB` finished |
 | `audit` | the sealed audit record | Audit on: every record written |
 | `pairing_code` | `code`, `device_id` | Device side: show this code to the user |
 | `online` | `device_id` | Device side: registered with the relay |
 | `blocked` | `reason` | Device side: debugging disallowed by device management |
 | `adbd_endpoint` | `addr` | Device side: adbd discovered |
 | `adbd_unreachable` | `reason` | Device side: Wireless debugging is off or unreachable |
+| `session_open` | `session_id`, `peer_label`, `transport`, `kind` | 1.1.0, device side. A desktop opened a session. `peer_label` is the desktop's `--label`, else the corporate user, else `desktop-<key fingerprint>`. `kind` is `adb` or `adb-pair` |
+| `session_close` | `session_id`, `reason` | 1.1.0, device side. `reason` is `closed`, `peer_closed`, `path_lost`, `ended_on_device` or `session_expired` |
+| `command_result` | `cmd`, `session_id`, `ok`, `error?` | 1.1.0, device side, `--control-stdin` only |
 | `error` | `reason` | CLI only: fatal error before exit |
+
+**Path events.** `session_id` is the tunnel id (16 hex characters), identical on the desktop and the phone, so the two sides' events and audit records can be joined. A tunnel emits at most one `path_down` per outage, followed by exactly one `path_up` or `path_lost`. A normal close (adb disconnects) emits none. The Go SDK delivers them with `Session` set to the client session (`s1`, …); the CLI prints them as JSON lines; the Android SDK folds the device side into `ConnectionState.Online.path` and `SetuManager.sessions`.
+
+**Device commands.** `setu device --control-stdin` reads one JSON command per line on stdin. The only command is `{"cmd":"end_session","session_id":"<id>"}`, which closes that session with reason `ended_on_device`; the desktop receives `peer_closed` instead of reconnecting. Each command is answered with a `command_result` event. The Android SDK uses this for `endSession`.
 
 ### 1.6 Errors
 
@@ -154,7 +207,11 @@ Use `errors.Is`. Denials wrap both `ErrDenied` and the specific cause.
 | `ErrTokenInvalid` / `ErrTokenExpired` | Corporate token failed verification or has expired | no |
 | `ErrNoGrant` | Policy does not grant this user the device | no |
 | `ErrBlocked` | Device management disallows debugging | no |
+| `ErrSessionExpired` | 1.1.0. Corporate `max_session_seconds` reached; `Connect` again (which re-authenticates) | no |
+| `ErrPeerClosed` | 1.1.0. The device ended the session (`SetuManager.endSession`) | no |
 | `ErrUnavailable` | Device offline or busy, or relay unreachable | yes |
+| `ErrADBPairFailed` | 1.1.0. `adb pair` failed: wrong code, closed dialog or wrong port | n/a |
+| `ErrUnsupported` | 1.1.0. The peer runs an older version without this feature | n/a |
 | `ErrNoRelay`, `ErrNoDevice`, `ErrNoSession`, `ErrClosed`, `ErrAuditDisabled` | Misuse of the client | n/a |
 
 ### 1.7 Diagnostics
@@ -178,13 +235,27 @@ The checks are `adb`, `state`, `paired_devices`, `proxy_env`, `relay_dns`, `rela
 
 Framing: one JSON-RPC 2.0 object per line, UTF-8, newline-terminated, at most 1 MiB. Requests without `id` are notifications and get no response. Batches are not supported.
 
+**Concurrency (1.1.0).** Requests on one connection run concurrently, so a slow `session.connect` does not hold up `session.list` or `session.cancel`. Responses may therefore arrive in a different order from the requests: match them by `id`, and use ids that are unique per connection. `auth`, and anything sent before `auth` succeeds, is handled in order. At most 128 requests may be in flight per connection; beyond that the daemon answers `-32027` (busy).
+
+**Ready line (1.1.0).** In TCP mode, once the listener is bound the daemon prints exactly one line to stdout and nothing else there:
+
+```json
+{"event":"daemon_ready","listen":"127.0.0.1:7605","version":"1.1.0","token_file":"/home/me/.config/genadb/daemon.token","pid":4242}
+```
+
+A UI that starts the daemon reads this line instead of polling the port; with `--listen 127.0.0.1:0` it learns the port the system picked. Diagnostics go to stderr.
+
 Startup flags mirror the CLI:
 
 ```
 --relay, --state, --mode solo|corporate, --identity-file, --policy,
 --audit auto|on|off, --audit-log, --audit-anchor-key-file, --audit-webhook-url, --audit-webhook-secret-file,
---proxy, --relay-ca, --relay-pin, --listen, --stdio
+--proxy, --relay-ca, --relay-pin, --listen, --stdio,
+--adb PATH        (1.1.0: adb for session.pair_adb)
+--label NAME      (1.1.0: name shown in the phone's session list)
 ```
+
+In corporate mode the daemon watches `--identity-file` (every 2 s) and rotates the token live, exactly as `auth.set_token` does.
 
 The webhook secret can also be supplied in `$GENADB_AUDIT_WEBHOOK_SECRET`.
 
@@ -193,14 +264,18 @@ The webhook secret can also be supplied in `$GENADB_AUDIT_WEBHOOK_SECRET`.
 | Method | Params | Result |
 |---|---|---|
 | `auth` | `{token}` | `{ok: true}` |
+| `auth.set_token` | `{token}` (1.1.0, corporate) | `{subject, token_id?, expires_at}`. Rotates the identity token without restarting the daemon or dropping sessions (section 1.1, `SetToken`) |
 | `version` | none | `{version, mode, audit: bool}` |
 | `doctor` | none | `DoctorReport` (section 1.7, JSON field names in lower snake case) |
 | `identity.public_key` | none | `{public_key}` |
 | `devices.list` | none | `{devices: [{id, paired, source}]}` |
+| `devices.presence` | none (1.1.0, corporate) | `{devices: [{device_id, online, connected_at?, transport?, sessions}]}` |
 | `devices.forget` | `{device_id}` | `{}` |
 | `session.connect` | `{device_id?, pairing_code?, listen?, timeout_ms?}` (default timeout 60000) | `SessionInfo` |
 | `session.list` | none | `{sessions: [SessionInfo]}` |
 | `session.stop` | `{session_id}` | `{}` |
+| `session.pair_adb` | `{device_id, pairing_code, pairing_port?, adb_path?, timeout_ms?}` (1.1.0; default timeout 60000; `pairing_port` 0 or absent discovers it on the phone) | `{device_id, paired, transport, output?}` |
+| `session.cancel` | `{request_id}` or `{device_id}` (1.1.0) | `{cancelled: n}`. Cancels in-flight requests: the one with that JSON-RPC `id` on this connection, or every pending `session.connect` / `session.pair_adb` for that device from any client of this daemon. Each cancelled request is answered with `-32022` |
 | `events.subscribe` | none | `{subscribed: true}`. This connection then receives `event` notifications |
 | `events.unsubscribe` | none | `{subscribed: false}` |
 | `audit.report` | `{format: "json"\|"csv"\|"html", since?, until?, include_events?}` (RFC 3339 times) | JSON: `{format, report: Report}`. CSV and HTML: `{format, content: string}` |
@@ -217,6 +292,14 @@ Unknown params fields are rejected with `-32602`.
 ```
 
 `params` is an Event (section 1.5).
+
+Each subscriber has its own queue of 256 events. A subscriber that falls behind loses events rather than slowing the daemon or other clients, and is told how many before the next event it does receive:
+
+```json
+{"jsonrpc":"2.0","method":"events.dropped","params":{"count":17}}
+```
+
+On `events.dropped`, refresh state with `session.list` (and `devices.presence`) rather than relying on the event stream alone.
 
 ### 2.3 Errors
 
@@ -239,6 +322,12 @@ Unknown params fields are rejected with `-32602`.
 | -32018 | `blocked` | |
 | -32020 | `no_session` | |
 | -32021 | `audit_disabled` | |
+| -32022 | `cancelled` | 1.1.0. Ended by `session.cancel` |
+| -32023 | `adb_pair_failed` | 1.1.0. `adb pair` failed |
+| -32024 | `unsupported` | 1.1.0. The device runs an older agent |
+| -32025 | `session_expired` | 1.1.0. Corporate session cap reached; reconnect to re-authenticate |
+| -32026 | `peer_closed` | 1.1.0. The device ended the session |
+| -32027 | `busy` | 1.1.0. Too many requests in flight on this connection |
 
 The most specific code wins. For example, a wrong pairing code returns -32013 rather than -32010.
 
@@ -249,9 +338,22 @@ The most specific code wins. For example, a wrong pairing code returns -32013 ra
 ← {"jsonrpc":"2.0","id":1,"result":{"ok":true}}
 → {"jsonrpc":"2.0","id":2,"method":"events.subscribe"}
 ← {"jsonrpc":"2.0","id":2,"result":{"subscribed":true}}
-→ {"jsonrpc":"2.0","id":3,"method":"session.connect","params":{"pairing_code":"4821-K7QZPM"}}
+→ {"jsonrpc":"2.0","id":3,"method":"session.connect","params":{"pairing_code":"4821-093357"}}
 ← {"jsonrpc":"2.0","method":"event","params":{"type":"paired",…}}
 ← {"jsonrpc":"2.0","id":3,"result":{"session_id":"s1","adb_addr":"127.0.0.1:41377","device_id":"pixel-7","started":"…"}}
+→ {"jsonrpc":"2.0","id":4,"method":"session.pair_adb","params":{"device_id":"pixel-7","pairing_port":37099,"pairing_code":"482913"}}
+← {"jsonrpc":"2.0","id":4,"result":{"device_id":"pixel-7","paired":true,"transport":"relay-wss"}}
+← {"jsonrpc":"2.0","method":"event","params":{"type":"path_down","session":"s1","fields":{"session_id":"4be1c0d2a9f37e11","reason":"keepalive_timeout","transport":"relay-wss"}}}
+← {"jsonrpc":"2.0","method":"event","params":{"type":"path_up","session":"s1","fields":{"session_id":"4be1c0d2a9f37e11","transport":"lan","outage_ms":2900}}}
+```
+
+Cancelling a connect that is waiting for an offline device:
+
+```
+→ {"jsonrpc":"2.0","id":"c1","method":"session.connect","params":{"device_id":"pixel-7"}}
+→ {"jsonrpc":"2.0","id":5,"method":"session.cancel","params":{"request_id":"c1"}}
+← {"jsonrpc":"2.0","id":5,"result":{"cancelled":1}}
+← {"jsonrpc":"2.0","id":"c1","error":{"code":-32022,"message":"…","data":{"kind":"cancelled"}}}
 ```
 
 ---
@@ -280,9 +382,13 @@ Common optional fields are `role` (`relay`, `desktop` or `device`), `user` (toke
 | `session_end` | desktop, relay | `transport`, `bytes_up`, `bytes_down`, `duration_ms`, `reason` |
 | `adb_op` | desktop | `op`, `path?`, `command?`, `sha256?`, `bytes_up`, `bytes_down`, `duration_ms`, `result?` (`failed`) |
 | `denied` | relay | `user?`, `device?`, `reason` |
-| `revoked` | relay (admin API) | `user?`, `device?`, `sessions_killed` |
+| `revoked` | relay (admin API) | `user?`, `device?`, `sessions_killed`, `persisted` |
+| `unrevoked` | relay (admin API, 1.1.0) | `user?`, `device?`, `persisted` |
+| `token_rotated` | desktop (1.1.0) | `user`, `token_id` of the new token |
+| `session_terminated` | desktop (1.1.0) | `reason`: `session_expired` or `peer_closed` |
 | `rate_limited`, `device_online`, `device_offline` | relay | `role`, `kind`, `device` |
 | `agent_start`, `online`, `pairing_code_issued`, `adbd_endpoint`, `adbd_unreachable`, `blocked`, `policy_missing`, `agent_error`, `agent_exit`, `agent_stop` | device (Android SDK) | `mode`, `transport`, `reason`, `addr`, `exit_code`, `missing` |
+| `session_open`, `session_close`, `session_end_requested`, `path_down`, `path_up`, `path_lost` | device (Android SDK, 1.1.0) | `session_id`, `peer_label`, `transport`, `kind`, `reason`, `outage_ms` |
 
 `op` values:
 
@@ -382,7 +488,7 @@ Delivery is asynchronous, in order, and retried with backoff. Collectors should 
 
 ## 4. Android SDK (`setu-android`)
 
-Artifact: `setu-android-1.0.1.aar` (Gradle module `:genadb-android`). Package: `dev.genadb.sdk`. The minimum SDK is 29. The AAR carries `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES.txt` under `assets/setu-sdk/`, so apps that embed it ship the required notices. The library is built in Kotlin explicit-API mode, so everything not listed here is internal.
+Artifact: `setu-android-1.1.0.aar` (Gradle module `:genadb-android`). Package: `dev.genadb.sdk`. The minimum SDK is 29. The AAR carries `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES.txt` under `assets/setu-sdk/`, so apps that embed it ship the required notices. The library is built in Kotlin explicit-API mode, so everything not listed here is internal.
 
 Consuming apps must keep native libraries extracted, because the agent runs as an executable: set `packaging { jniLibs { useLegacyPackaging = true } }`. Run the agent from a foreground service.
 
@@ -394,6 +500,7 @@ open class SetuManager {
     val policyStatus: StateFlow<PolicyStatus>
     val auditEvents: StateFlow<AuditEvent?>          // latest record
     val recentAuditEvents: StateFlow<List<AuditEvent>>  // last 200
+    val sessions: StateFlow<List<DeviceSession>>     // 1.1.0: who is debugging this phone now
     val auditLogFile: File?
 
     fun start(config: SetuConfig? = null)            // throws GenAdbException.NotConfigured
@@ -401,6 +508,7 @@ open class SetuManager {
     fun stop()
     fun status(): GenAdbStatus
     fun refreshPolicy(): PolicyStatus                // on ACTION_APPLICATION_RESTRICTIONS_CHANGED
+    fun endSession(id: String): Boolean              // 1.1.0: false if no such session
 
     open class Builder(context: Context) {
         fun config(SetuConfig); fun agentLauncher(AgentLauncher)
@@ -420,6 +528,8 @@ open class SetuManager {
 
 `pair()` can throw `GenAdbException.PairingUnavailable` (corporate mode), `GenAdbException.PolicyMissing`, `GenAdbException.Blocked` or `GenAdbException.Timeout`.
 
+`sessions` (1.1.0) lists the desktops connected right now, from the agent's `session_open` and `session_close` events: who (`peerLabel`), over which transport, and whether the path is up. It is cleared when the agent stops or exits. `endSession(id)` ends one session from the phone: the agent closes it with reason `ended_on_device`, the desktop's session ends with `peer_closed` (`ErrPeerClosed`, not retried), and a `session_end_requested` audit record is written. Use it for an "End" button next to each session.
+
 Corporate configuration that is incomplete (an enrollment token without a policy, or the reverse) never throws from `start()` and never launches the agent. The state becomes `ConnectionState.PolicyMissing(missing)`, `policyStatus.missing` names the absent item, and a `policy_missing` audit record is written. Call `start()` again on `ACTION_APPLICATION_RESTRICTIONS_CHANGED`. Errors inside the agent supervisor are reported as `Reconnecting`, never thrown into the host app.
 
 ### 4.2 Models
@@ -432,12 +542,19 @@ data class SetuConfig(relayUrl: String, mode: Mode = SOLO, adbd: String = "auto"
 
 sealed interface ConnectionState {
     object Idle; object Starting
-    data class Online(deviceId, pairingCode: String?, adbdEndpoint: String?, warning: String?)
+    data class Online(deviceId, pairingCode: String?, adbdEndpoint: String?, warning: String?,
+                      path: PathStatus? = null)                      // 1.1.0
     data class Reconnecting(attempt: Int, reason: String?, retryInMs: Long)
     data class Blocked(reason: String)
     data class PolicyMissing(missing: String)   // "policy_json" | "enroll_token"
 }
 data class PolicyStatus(mode, debuggingAllowed, managed, auditEnabled, missing: String?)
+
+// 1.1.0
+enum class PathState { UP, DOWN, LOST }
+data class PathStatus(sessionId: String, state: PathState, transport: String?, reason: String?, outageMs: Long?)
+data class DeviceSession(id: String, peerLabel: String, transport: String, kind: String = "adb",
+    openedAtMs: Long, path: PathState = PathState.UP)
 data class AuditEvent(seq, timestamp, type, deviceId, fields: Map<String,String>, eventHash, prevEventHash)
 data class GenAdbStatus(connection, policy, running, auditLogPath)
 enum class Mode { SOLO, CORPORATE };  enum class AuditMode { AUTO, ON, OFF }
@@ -449,7 +566,7 @@ Managed configuration takes precedence over `SetuConfig`. The EMM keys are:
 |---|---|
 | `relay_url` | Relay to use |
 | `enroll_token` | Switches to corporate mode |
-| `policy_json` | Organisation policy |
+| `policy_json` | Organisation policy. Since 1.1.0 the SDK keeps only the grants that name this device (`scopePolicyJson`), and EMMs should push the per-device policy from `setu policy scope` or `GET /v1/policy?device=` (section 5.3) |
 | `relay_pin` | Relay certificate pin |
 
 `UserManager.DISALLOW_DEBUGGING_FEATURES` produces `ConnectionState.Blocked`. In corporate mode, audit is always on. The device log at `auditLogFile` uses the schema in section 3, and `setu audit verify` and `setu audit report` read it.
@@ -462,3 +579,52 @@ Managed configuration takes precedence over `SetuConfig`. The EMM keys are:
 | `PolicyProvider` | `AndroidPolicyProvider` | Supply managed configuration and user restrictions |
 | `NetworkInfoProvider` | `AndroidNetworkInfo` | Supply DNS servers of the active network |
 | `AuditSink` | `HashChainedAuditLog(<state>/audit.jsonl)` | Seal and store records |
+
+### 4.4 Notifications and the lock screen (1.1.0)
+
+The pairing code is a credential: anyone who reads it within its lifetime can pair. `SetuNotifications.content(state, sessions)` returns `NotificationContent(title, text, publicText, containsSecret)`. `text` may contain the code and is for the unlocked phone. `publicText` never does (it is redacted even if a future wording would include it). Post the foreground-service notification with `VISIBILITY_PRIVATE` and a public version built from `publicText`:
+
+```kotlin
+val c = SetuNotifications.content(state, sessions)
+val public = Notification.Builder(ctx, CHANNEL).setSmallIcon(icon).setContentTitle(c.title).setContentText(c.publicText).build()
+Notification.Builder(ctx, CHANNEL).setSmallIcon(icon).setContentTitle(c.title).setContentText(c.text)
+    .setVisibility(Notification.VISIBILITY_PRIVATE).setPublicVersion(public).setOngoing(true).build()
+```
+
+The companion app does this, combining `connectionState` and `sessions` so the notification also says who is connected ("Debugging session: ci-laptop") and when a session is reconnecting.
+
+---
+
+## 5. Relay admin API and corporate policy
+
+### 5.1 Admin API
+
+`setu relay --admin 127.0.0.1:7001 --admin-token …` serves an HTTP API on a separate listener. Every call needs `Authorization: Bearer <admin token>`. Bodies are JSON.
+
+| Endpoint | Body or query | Result |
+|---|---|---|
+| `POST /v1/revoke` | `{"user":"alice"}` and/or `{"device":"pixel-7"}` | `{ok, sessions_killed, persisted}`. Live sessions of that user or device are killed at once |
+| `POST /v1/unrevoke` (1.1.0) | same | `{ok, persisted}` |
+| `GET /v1/revocations` (1.1.0) | none | `{users: [...], devices: [...]}` |
+| `GET /v1/devices` (1.1.0) | none | `{devices: [{device_id, online, connected_at?, transport?, sessions, revoked?}]}`: every device connected now |
+| `GET /v1/policy?device=<id>` (1.1.0) | none | The organisation policy scoped to that device (section 5.3) |
+
+**Persistence (1.1.0).** Revocations are written to `revocations.json` in the relay's `--state` directory (atomically, mode 0600) before the call returns, and reloaded on start, so a restarted relay keeps refusing revoked users and devices. If the file cannot be written, the revocation still applies in memory and the call returns HTTP 500 saying it was not persisted. A corrupt file stops the relay from starting rather than silently forgetting revocations.
+
+### 5.2 Presence for users (1.1.0)
+
+Corporate users see the same presence data for their granted devices only, through `SetuClient.Presence` or the daemon's `devices.presence`. The relay checks the user's token and proof of possession and answers from the policy; revocation flags are not revealed.
+
+### 5.3 Session cap and per-device policy (1.1.0)
+
+`max_session_seconds` in the policy is a hard cap on how long a tunnel may live, counted from its handshake, however many times its path is rejoined. Both the desktop (with its policy) and the phone (with the policy it was given) enforce it, and the first to reach its cap ends the session. When it is reached, the phone closes the tunnel with reason `session_expired`, the desktop ends the session with `ErrSessionExpired` (`-32025` in the daemon), and the reconnect policy does not resume it: reconnecting requires a new `Connect`, which presents the identity token again. Rejoining a dropped path never extends the cap, because a rejoin is not a new handshake. To give one device a shorter cap, push it a policy with a lower `max_session_seconds`.
+
+The organisation policy maps every user to devices. A phone needs only its own grants, so push a scoped copy instead of the whole map:
+
+```bash
+setu policy scope --policy org-policy.json --device pixel-7 --out pixel-7-policy.json
+curl -H "Authorization: Bearer $ADMIN" "http://127.0.0.1:7001/v1/policy?device=pixel-7"
+```
+
+The scoped policy keeps the trust settings (relay id, issuer, IdP key, session cap) and only the grants that name this device, each listing just this device. Devices also scope whatever policy they are given before using it.
+

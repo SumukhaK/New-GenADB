@@ -47,6 +47,20 @@ public open class SetuManager internal constructor(
     public val recentAuditEvents: StateFlow<List<AuditEvent>> get() = core.recentAuditEvents
 
     /**
+     * Live debugging sessions on this device: who is connected ([DeviceSession.peerLabel]),
+     * over which transport, and whether the path is currently up. Updated from the
+     * agent's `session_open` / `session_close` / `path_*` events.
+     */
+    public val sessions: StateFlow<List<DeviceSession>> get() = core.sessions
+
+    /**
+     * Ends one session from the device side. The desktop receives a graceful
+     * `peer_closed` (reason `ended_on_device`) instead of a reconnect loop.
+     * Returns false if no such session is live.
+     */
+    public fun endSession(id: String): Boolean = core.endSession(id)
+
+    /**
      * Starts (or restarts) the agent; [config] replaces the builder's configuration.
      * Incomplete corporate configuration does not throw: it sets
      * [ConnectionState.PolicyMissing] and waits for the next start().

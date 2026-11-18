@@ -25,8 +25,9 @@ type secureConn struct {
 	wmu     sync.Mutex
 	rbuf    []byte
 
-	sid       []byte // session id (for resumption)
-	resumeKey []byte // secret used to authenticate a rejoin
+	sid       []byte   // session id (for resumption)
+	resumeKey []byte   // secret used to authenticate a rejoin
+	peerCaps  []string // capabilities the peer announced in the handshake
 }
 
 func newAEAD(key []byte) cipher.AEAD {

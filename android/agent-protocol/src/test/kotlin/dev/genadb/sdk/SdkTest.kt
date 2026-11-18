@@ -77,7 +77,7 @@ class ProtocolTest {
         val e = effective(SetuConfig("wss://relay.example/"), ManagedPolicy())
         val args = agentArgs(e, "/data/state", null)
         assertEquals(listOf("device", "--relay", "wss://relay.example/", "--adbd", "auto", "--state", "/data/state",
-            "--mode", "solo", "--lan-listen", "0.0.0.0:47100"), args)
+            "--mode", "solo", "--lan-listen", "0.0.0.0:47100", "--control-stdin"), args)
         assertFalse(e.policy.auditEnabled, "solo audit is off by default")
     }
 
@@ -96,7 +96,7 @@ class ProtocolTest {
 
     @Test
     fun auditNeverCarriesPairingCode() {
-        val (type, fields) = auditFor(AgentEvent.PairingCode("1234-ABCDEF", "dev"))!!
+        val (type, fields) = auditFor(AgentEvent.PairingCode("1234-567890", "dev"))!!
         assertEquals("pairing_code_issued", type)
         assertTrue(fields.isEmpty())
     }
@@ -161,9 +161,9 @@ class ManagerCoreTest {
         m.start(SetuConfig("ws://relay:7000/", audit = AuditMode.ON))
         val p = fake.awaitLaunch()
         assertEquals("10.0.0.53", fake.envs.take()["GENADB_DNS"])
-        p.emit("""{"event":"pairing_code","code":"4321-QWERTY","device_id":"dev-9"}""")
+        p.emit("""{"event":"pairing_code","code":"4321-908172","device_id":"dev-9"}""")
         p.emit("""{"event":"online","device_id":"dev-9"}""")
-        assertEquals("4321-QWERTY", withTimeout(5000) { m.pair(5000) })
+        assertEquals("4321-908172", withTimeout(5000) { m.pair(5000) })
         val online = m.connectionState.value
         assertIs<ConnectionState.Online>(online)
         assertEquals("dev-9", online.deviceId)
@@ -181,7 +181,7 @@ class ManagerCoreTest {
         val types = m.recentAuditEvents.value.map { it.type }
         assertEquals(listOf("agent_start", "pairing_code_issued", "online", "agent_exit", "agent_start", "online", "agent_stop"), types)
         val log = m.auditFile.readText()
-        assertFalse("4321-QWERTY" in log, "pairing code must never reach the audit log")
+        assertFalse("4321-908172" in log, "pairing code must never reach the audit log")
         assertEquals(0, HashChainedAuditLog.verify(m.auditFile))
         assertEquals(m.auditFile.absolutePath, m.status().auditLogPath)
     }

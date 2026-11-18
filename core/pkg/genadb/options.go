@@ -75,6 +75,9 @@ type config struct {
 	onEvent    func(Event)
 	logger     func(string)
 	eventBuf   int
+	adbPath    string
+	adbPairer  ADBPairer
+	label      string
 }
 
 // Option configures a Client.
@@ -131,6 +134,11 @@ func WithEventHandler(f func(Event)) Option { return func(c *config) { c.onEvent
 // channel is full, new events are dropped (counted by DroppedEvents) rather
 // than stalling tunnels.
 func WithEventBuffer(n int) Option { return func(c *config) { c.eventBuf = n } }
+
+// WithDeviceLabel sets how this computer is named in the phone's session
+// list (SetuManager.sessions on Android). It travels end-to-end encrypted.
+// Default: none (the phone shows the user id or a key fingerprint).
+func WithDeviceLabel(label string) Option { return func(c *config) { c.label = label } }
 
 // WithLogger receives human-readable diagnostic lines (default: stderr).
 // The logger is process-wide: the last Client to set one wins.

@@ -19,6 +19,16 @@ var (
 	ErrTokenExpired = errors.New("identity token expired")
 	ErrNoGrant      = errors.New("no grant for this device")
 	ErrBlocked      = errors.New("debugging disallowed by device policy")
+	// ErrUnsupported: the peer runs an older agent without this capability.
+	ErrUnsupported = errors.New("not supported by the device agent")
+	// ErrADBPairFailed: Android Wireless-debugging pairing did not complete.
+	ErrADBPairFailed = errors.New("adb pairing failed")
+	// ErrSessionExpired: the corporate max_session_seconds cap ended the
+	// session; connect again (with a valid token) to continue.
+	ErrSessionExpired = errors.New("session reached max_session_seconds")
+	// ErrPeerClosed: the other side ended the session on purpose (for
+	// example the phone user tapped "end session").
+	ErrPeerClosed = errors.New("session ended by peer")
 )
 
 var errDenied = ErrDenied

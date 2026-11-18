@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -58,6 +59,41 @@ func (p *policy) granted(user, device string) bool {
 		}
 	}
 	return false
+}
+
+// scopedTo drops every grant that does not name device (the device agent
+// keeps only what concerns it).
+func (p *policy) scopedTo(device string) {
+	kept := p.Grants[:0]
+	for _, g := range p.Grants {
+		for _, d := range g.Devices {
+			if d == device {
+				g.Devices = []string{device}
+				kept = append(kept, g)
+				break
+			}
+		}
+	}
+	p.Grants = kept
+}
+
+// devicesFor lists the devices granted to user, sorted and de-duplicated.
+func (p *policy) devicesFor(user string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, g := range p.Grants {
+		if g.User != user {
+			continue
+		}
+		for _, d := range g.Devices {
+			if !seen[d] {
+				seen[d] = true
+				out = append(out, d)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 type claims struct {
@@ -144,4 +180,72 @@ func pubString64(k ed25519.PublicKey) string { return base64.RawURLEncoding.Enco
 func popMessage(challenge []byte, token string) []byte {
 	th := sha256.Sum256([]byte(token))
 	return append(append([]byte("genadb-relay-pop-v1"), challenge...), th[:]...)
+}
+
+// TokenInfo is what a verified user token says (never the token itself).
+type TokenInfo struct {
+	Subject string
+	TokenID string
+	Expires time.Time
+}
+
+// VerifyUserToken checks a corporate user token the way the relay and the
+// device will: signature, issuer, audience, validity, type "user", and its
+// binding to this machine's identity key in state. Failures wrap ErrDenied
+// and ErrTokenExpired or ErrTokenInvalid.
+func VerifyUserToken(policyPath, state, token string) (TokenInfo, error) {
+	pol, err := loadPolicy(policyPath)
+	if err != nil {
+		return TokenInfo{}, err
+	}
+	key, err := loadOrCreateKey(state)
+	if err != nil {
+		return TokenInfo{}, err
+	}
+	cl, err := pol.verifyToken(token, "user", key.Public().(ed25519.PublicKey))
+	if err != nil {
+		return TokenInfo{}, deniedError("token: " + err.Error())
+	}
+	return TokenInfo{Subject: cl.Sub, TokenID: cl.Jti, Expires: time.Unix(cl.Exp, 0).UTC()}, nil
+}
+
+// ScopePolicy returns the organisation policy reduced to what one device
+// needs: the trust settings (relay id, issuer, IdP key, session cap) and
+// only the grants that name this device, each listing just this device.
+// Push this per device through MDM instead of the organisation's whole
+// user-to-device map. Unknown top-level fields are kept.
+func ScopePolicy(raw []byte, deviceID string) ([]byte, error) {
+	if deviceID == "" {
+		return nil, errors.New("policy scope: a device id is required")
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("policy scope: %w", err)
+	}
+	var grants []struct {
+		User    string   `json:"user"`
+		Devices []string `json:"devices"`
+	}
+	if g, ok := doc["grants"]; ok {
+		if err := json.Unmarshal(g, &grants); err != nil {
+			return nil, fmt.Errorf("policy scope: grants: %w", err)
+		}
+	}
+	type grant struct {
+		User    string   `json:"user"`
+		Devices []string `json:"devices"`
+	}
+	scoped := []grant{}
+	seen := map[string]bool{}
+	for _, g := range grants {
+		for _, d := range g.Devices {
+			if d == deviceID && !seen[g.User] {
+				seen[g.User] = true
+				scoped = append(scoped, grant{User: g.User, Devices: []string{deviceID}})
+			}
+		}
+	}
+	gb, _ := json.Marshal(scoped)
+	doc["grants"] = gb
+	return json.MarshalIndent(doc, "", "  ")
 }

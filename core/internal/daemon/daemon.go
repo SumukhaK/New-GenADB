@@ -42,6 +42,12 @@ const (
 	CodeBlocked        = -32018
 	CodeNoSession      = -32020
 	CodeAuditDisabled  = -32021
+	CodeCancelled      = -32022
+	CodeADBPairFailed  = -32023
+	CodeUnsupported    = -32024
+	CodeSessionExpired = -32025
+	CodePeerClosed     = -32026
+	CodeBusy           = -32027
 )
 
 // Error is a JSON-RPC error object. Data.kind names the sentinel.
@@ -58,6 +64,10 @@ var sentinels = []struct {
 	code int
 	kind string
 }{
+	{genadb.ErrSessionExpired, CodeSessionExpired, "session_expired"},
+	{genadb.ErrPeerClosed, CodePeerClosed, "peer_closed"},
+	{genadb.ErrUnsupported, CodeUnsupported, "unsupported"},
+	{genadb.ErrADBPairFailed, CodeADBPairFailed, "adb_pair_failed"},
 	{genadb.ErrBadCode, CodeBadCode, "bad_code"},
 	{genadb.ErrNotPaired, CodeNotPaired, "not_paired"},
 	{genadb.ErrRevoked, CodeRevoked, "revoked"},
@@ -113,6 +123,66 @@ type Server struct {
 
 	mu   sync.Mutex
 	subs map[*conn]struct{}
+
+	reqMu    sync.Mutex
+	inflight map[*inflight]struct{}
+}
+
+// MaxInFlight bounds concurrently running requests per connection. Beyond
+// it a request is answered at once with CodeBusy instead of queueing behind
+// slow calls.
+const MaxInFlight = 128
+
+// inflight is one running request, cancellable with session.cancel.
+type inflight struct {
+	c         *conn
+	id        string // compact JSON of the request id
+	method    string
+	deviceID  string
+	cancel    context.CancelFunc
+	cancelled atomic.Bool
+}
+
+func (s *Server) track(f *inflight) func() {
+	s.reqMu.Lock()
+	if s.inflight == nil {
+		s.inflight = map[*inflight]struct{}{}
+	}
+	s.inflight[f] = struct{}{}
+	s.reqMu.Unlock()
+	return func() {
+		s.reqMu.Lock()
+		delete(s.inflight, f)
+		s.reqMu.Unlock()
+	}
+}
+
+// cancelRequests cancels in-flight requests: the one with request id rid on
+// connection c, and/or every session.connect / session.pair_adb for device.
+func (s *Server) cancelRequests(c *conn, rid, device string) int {
+	s.reqMu.Lock()
+	var hit []*inflight
+	for f := range s.inflight {
+		switch {
+		case rid != "" && f.c == c && f.id == rid,
+			device != "" && f.deviceID == device && (f.method == "session.connect" || f.method == "session.pair_adb"):
+			hit = append(hit, f)
+		}
+	}
+	s.reqMu.Unlock()
+	for _, f := range hit {
+		f.cancelled.Store(true)
+		f.cancel()
+	}
+	return len(hit)
+}
+
+func compactID(raw json.RawMessage) string {
+	var b bytes.Buffer
+	if json.Compact(&b, raw) != nil {
+		return string(raw)
+	}
+	return b.String()
 }
 
 // SubscriberQueue is how many events may wait for one subscriber. A
@@ -143,7 +213,7 @@ type conn struct {
 	srv     *Server
 	w       io.Writer
 	wmu     sync.Mutex
-	authed  bool
+	authed  atomic.Bool
 	broken  atomic.Bool
 	closer  io.Closer // set for network connections
 	queue   chan genadb.Event
@@ -213,13 +283,23 @@ func (s *Server) unsubscribe(c *conn) {
 	}
 }
 
-// ServeConn handles one stream until EOF or ctx ends.
+// ServeConn handles one stream until EOF or ctx ends. Requests run
+// concurrently (up to MaxInFlight), so a slow session.connect never holds up
+// session.list, doctor or audit calls; responses may therefore arrive out of
+// order and carry the request's id. "auth" is handled in order, before any
+// request read after it.
 func (s *Server) ServeConn(ctx context.Context, rw io.ReadWriter) error {
-	c := &conn{srv: s, w: rw, authed: s.Token == ""}
+	ctx, cancel := context.WithCancel(ctx)
+	c := &conn{srv: s, w: rw}
+	c.authed.Store(s.Token == "")
 	if cl, ok := rw.(io.Closer); ok {
 		c.closer = cl
 	}
+	var wg sync.WaitGroup
 	defer s.unsubscribe(c)
+	defer wg.Wait()
+	defer cancel() // a client that went away cannot use its answers
+	slots := make(chan struct{}, MaxInFlight)
 	sc := bufio.NewScanner(rw)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
@@ -236,22 +316,64 @@ func (s *Server) ServeConn(ctx context.Context, rw io.ReadWriter) error {
 			c.send(response{JSONRPC: "2.0", ID: orNull(req.ID), Error: &Error{Code: CodeInvalidRequest, Message: "invalid request"}})
 			continue
 		}
-		res, err := s.call(ctx, c, req)
-		if len(req.ID) == 0 { // notification: no reply
+		if req.Method == "auth" || !c.authed.Load() {
+			s.handle(ctx, c, req, nil)
 			continue
 		}
-		r := response{JSONRPC: "2.0", ID: req.ID}
-		if err != nil {
-			r.Error = toRPCError(err)
-		} else {
-			if res == nil {
-				res = struct{}{}
+		select {
+		case slots <- struct{}{}:
+		default:
+			if len(req.ID) != 0 {
+				c.send(response{JSONRPC: "2.0", ID: req.ID, Error: &Error{Code: CodeBusy,
+					Message: fmt.Sprintf("more than %d requests in flight", MaxInFlight), Data: map[string]any{"kind": "busy"}}})
 			}
-			r.Result = res
+			continue
 		}
-		c.send(r)
+		rctx, rcancel := context.WithCancel(ctx)
+		f := &inflight{c: c, id: compactID(req.ID), method: req.Method, cancel: rcancel}
+		if len(req.ID) == 0 {
+			f.id = ""
+		}
+		if req.Method == "session.connect" || req.Method == "session.pair_adb" {
+			var p struct {
+				DeviceID string `json:"device_id"`
+			}
+			json.Unmarshal(req.Params, &p)
+			f.deviceID = p.DeviceID
+		}
+		untrack := s.track(f)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-slots }()
+			defer rcancel()
+			defer untrack()
+			s.handle(rctx, c, req, f)
+		}()
 	}
 	return sc.Err()
+}
+
+// handle runs one request and sends its response (none for notifications).
+func (s *Server) handle(ctx context.Context, c *conn, req request, f *inflight) {
+	res, err := s.call(ctx, c, req)
+	if len(req.ID) == 0 { // notification: no reply
+		return
+	}
+	r := response{JSONRPC: "2.0", ID: req.ID}
+	if err != nil {
+		if f != nil && f.cancelled.Load() {
+			r.Error = &Error{Code: CodeCancelled, Message: "cancelled by session.cancel", Data: map[string]any{"kind": "cancelled"}}
+		} else {
+			r.Error = toRPCError(err)
+		}
+	} else {
+		if res == nil {
+			res = struct{}{}
+		}
+		r.Result = res
+	}
+	c.send(r)
 }
 
 func orNull(id json.RawMessage) json.RawMessage {
@@ -314,14 +436,26 @@ func (s *Server) call(ctx context.Context, c *conn, req request) (any, error) {
 		if s.Token != "" && subtle.ConstantTimeCompare([]byte(p.Token), []byte(s.Token)) != 1 {
 			return nil, &Error{Code: CodeUnauthorized, Message: "bad token"}
 		}
-		c.authed = true
+		c.authed.Store(true)
 		return map[string]any{"ok": true}, nil
 	}
-	if !c.authed {
+	if !c.authed.Load() {
 		return nil, &Error{Code: CodeUnauthorized, Message: "call auth first"}
 	}
 	cl := s.Client
 	switch req.Method {
+	case "auth.set_token":
+		var p struct {
+			Token string `json:"token"`
+		}
+		if err := decode(req.Params, &p); err != nil {
+			return nil, err
+		}
+		if p.Token == "" {
+			return nil, &Error{Code: CodeInvalidParams, Message: "token is required"}
+		}
+		return cl.SetToken(p.Token)
+
 	case "version":
 		return map[string]any{"version": genadb.Version, "mode": cl.Mode(), "audit": cl.AuditPath() != ""}, nil
 
@@ -338,6 +472,13 @@ func (s *Server) call(ctx context.Context, c *conn, req request) (any, error) {
 			d = []genadb.DeviceInfo{}
 		}
 		return map[string]any{"devices": d}, err
+
+	case "devices.presence":
+		d, err := cl.Presence(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"devices": d}, nil
 
 	case "devices.forget":
 		var p struct {
@@ -368,6 +509,45 @@ func (s *Server) call(ctx context.Context, c *conn, req request) (any, error) {
 			return nil, err
 		}
 		return info(sess), nil
+
+	case "session.pair_adb":
+		var p struct {
+			DeviceID    string `json:"device_id"`
+			PairingPort int    `json:"pairing_port"`
+			PairingCode string `json:"pairing_code"`
+			ADBPath     string `json:"adb_path"`
+			TimeoutMS   int    `json:"timeout_ms"`
+		}
+		if err := decode(req.Params, &p); err != nil {
+			return nil, err
+		}
+		if p.DeviceID == "" || p.PairingCode == "" {
+			return nil, &Error{Code: CodeInvalidParams, Message: "device_id and pairing_code are required"}
+		}
+		if p.TimeoutMS <= 0 {
+			p.TimeoutMS = 60000
+		}
+		cctx, cancel := context.WithTimeout(ctx, time.Duration(p.TimeoutMS)*time.Millisecond)
+		defer cancel()
+		return cl.PairADB(cctx, genadb.PairADBRequest{DeviceID: p.DeviceID, PairingPort: p.PairingPort,
+			PairingCode: p.PairingCode, ADBPath: p.ADBPath})
+
+	case "session.cancel":
+		var p struct {
+			RequestID json.RawMessage `json:"request_id"`
+			DeviceID  string          `json:"device_id"`
+		}
+		if err := decode(req.Params, &p); err != nil {
+			return nil, err
+		}
+		rid := ""
+		if len(p.RequestID) != 0 && string(p.RequestID) != "null" {
+			rid = compactID(p.RequestID)
+		}
+		if rid == "" && p.DeviceID == "" {
+			return nil, &Error{Code: CodeInvalidParams, Message: "request_id or device_id is required"}
+		}
+		return map[string]any{"cancelled": s.cancelRequests(c, rid, p.DeviceID)}, nil
 
 	case "session.list":
 		out := []SessionInfo{}

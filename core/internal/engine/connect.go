@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -26,8 +27,17 @@ type desktopAgent struct {
 	audit                   audit.Sink
 	user, tokenID, deviceID string
 
+	ctx      context.Context // closes relay streams still being set up when cancelled
+	mode     string
+	pol      *policy
+	tokenFn  func() string
+	idMu     sync.Mutex // guards user, tokenID, auditTok
+	auditTok string     // the token user/tokenID were derived from
+
 	mu      sync.Mutex
 	tunnels map[*tunnel]struct{}
+	ln      net.Listener
+	termErr error
 }
 
 // EventFunc receives machine-readable agent events ("listening",
@@ -48,12 +58,132 @@ type DesktopConfig struct {
 	Dial       Dialer           // overrides the relay dialer (nil = Transport.Dialer())
 	Events     EventFunc        // receives events; nil = discard
 	Audit      audit.Sink       // receives session/operation records; nil = none
+	Label      string           // display name for this computer on the phone (v1.1.0+; sent end-to-end encrypted)
+	// Token, when set, returns the current corporate identity token. It is
+	// consulted for every new stream and rejoin, so a rotated token takes
+	// effect without restarting the session (v1.1.0+). Identity is the
+	// token used when Token is nil.
+	Token func() string
 }
 
 // RunDesktop pairs (if a code is given), verifies the device, exposes a local
 // adb endpoint and tunnels every adb connection to the device until ctx is
 // cancelled. It returns ctx.Err() after a clean shutdown.
 func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
+	a, params, err := newDesktop(ctx, &cfg)
+	if err != nil {
+		return err
+	}
+	id := cfg.Device
+	if cfg.Code != "" {
+		np, secret, ok := strings.Cut(cfg.Code, "-")
+		if !ok {
+			return fmt.Errorf("%w: %w: pairing code must look like NNNN-SSSSSS", errDenied, ErrBadCode)
+		}
+		c, br, did, err := a.openSession(hello{Role: "desktop", Code: np})
+		if err != nil {
+			return err
+		}
+		_, peer, err := clientHandshake(c, br, initiatorParams{id: a.key, mode: "pair", secret: secret, nameplate: np, target: "probe"})
+		c.Close()
+		if err != nil {
+			return fmt.Errorf("%w: %w", errDenied, err)
+		}
+		if err := savePeer(cfg.State, did, peer); err != nil {
+			return err
+		}
+		id = did
+		cfg.Events("paired", map[string]any{"device_id": id})
+	}
+	if err := a.pin(&params, id); err != nil {
+		return err
+	}
+	// verify the device is reachable and still trusts us before exposing a port
+	c, br, rep0, err := a.openSessionRep(hello{Role: "desktop", DeviceID: id})
+	if err != nil {
+		return err
+	}
+	lan := rep0.LAN
+	probe := params
+	probe.target = "probe"
+	_, _, err = clientHandshake(c, br, probe)
+	c.Close()
+	if err != nil {
+		return fmt.Errorf("%w: %v", errDenied, err)
+	}
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.ln = ln
+	a.mu.Unlock()
+	stop := context.AfterFunc(ctx, func() {
+		ln.Close()
+		a.closeAll("")
+	})
+	defer stop()
+	if a.pol != nil && a.pol.MaxSessionSeconds > 0 {
+		// The corporate hard cap ends the whole session, however often its
+		// paths were rejoined; continuing needs a new Connect, which
+		// re-authenticates. The device enforces the same cap on its side.
+		limit := time.Duration(a.pol.MaxSessionSeconds) * time.Second
+		tm := time.AfterFunc(limit, func() {
+			a.terminate(fmt.Errorf("%w: %w (%ds); connect again to re-authenticate", errDenied, ErrSessionExpired, a.pol.MaxSessionSeconds),
+				"session_expired")
+		})
+		defer tm.Stop()
+	}
+	cfg.Events("listening", map[string]any{"addr": ln.Addr().String(), "device_id": id})
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if t := a.terminated(); t != nil {
+				return t
+			}
+			return err
+		}
+		go a.serveADB(conn, id, lan, params)
+	}
+}
+
+// terminate ends the whole session for good (hard cap reached, or the
+// device ended it): no more adb connections, every tunnel closed with
+// reason, and RunDesktop returns err. The first call wins.
+func (a *desktopAgent) terminate(err error, reason string, extra ...any) {
+	a.mu.Lock()
+	if a.termErr != nil {
+		a.mu.Unlock()
+		return
+	}
+	a.termErr = err
+	ln := a.ln
+	a.mu.Unlock()
+	logf("session ended: %v", err)
+	f := map[string]any{"device_id": a.deviceID, "reason": reason}
+	for i := 0; i+1 < len(extra); i += 2 {
+		f[fmt.Sprint(extra[i])] = extra[i+1]
+	}
+	a.events(reason, f)
+	a.record(audit.Event{"event": "session_terminated", "reason": reason})
+	if ln != nil {
+		ln.Close()
+	}
+	a.closeAll(reason)
+}
+
+func (a *desktopAgent) terminated() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.termErr
+}
+
+// newDesktop loads the identity and builds the handshake parameters shared
+// by every stream to the device (corporate checks included).
+func newDesktop(ctx context.Context, cfg *DesktopConfig) (*desktopAgent, initiatorParams, error) {
 	if cfg.Listen == "" {
 		cfg.Listen = "127.0.0.1:0"
 	}
@@ -71,26 +201,26 @@ func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
 	}
 	key, err := loadOrCreateKey(cfg.State)
 	if err != nil {
-		return err
+		return nil, initiatorParams{}, err
 	}
 	a := &desktopAgent{relayAddr: cfg.Relay, state: cfg.State, key: key, token: cfg.Identity, dial: cfg.Dial,
-		events: cfg.Events, audit: cfg.Audit, tunnels: map[*tunnel]struct{}{}}
-	params := initiatorParams{id: key, mode: "resume", token: cfg.Identity}
+		events: cfg.Events, audit: cfg.Audit, tunnels: map[*tunnel]struct{}{}, mode: cfg.Mode, ctx: ctx}
+	a.tokenFn = cfg.Token
+	params := initiatorParams{id: key, mode: "resume", token: cfg.Identity, tokenFn: cfg.Token, label: cleanReason([]byte(cfg.Label))}
 	if cfg.Mode == "corporate" {
 		if cfg.Identity == "" {
-			return fmt.Errorf("%w: corporate mode requires an identity token", errDenied)
+			return nil, params, fmt.Errorf("%w: corporate mode requires an identity token", errDenied)
 		}
 		pol, err := loadPolicy(cfg.PolicyPath)
 		if err != nil {
-			return err
+			return nil, params, err
 		}
 		if cfg.Device == "" {
-			return fmt.Errorf("corporate mode requires a device id")
+			return nil, params, fmt.Errorf("corporate mode requires a device id")
 		}
+		a.pol = pol
 		// Audit identity: the token's subject and ID, never the token itself.
-		if cl, err := pol.verifyToken(cfg.Identity, "user", key.Public().(ed25519.PublicKey)); err == nil {
-			a.user, a.tokenID = cl.Sub, cl.Jti
-		}
+		a.identity()
 		want := cfg.Device
 		// the device must prove an MDM enrollment bound to the key it uses
 		params.verifyPeer = func(peer ed25519.PublicKey, tok string) error {
@@ -104,70 +234,133 @@ func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
 			return nil
 		}
 	}
-	id := cfg.Device
-	if cfg.Code != "" {
-		np, secret, ok := strings.Cut(cfg.Code, "-")
-		if !ok {
-			return fmt.Errorf("%w: %w: pairing code must look like NNNN-SSSSSS", errDenied, ErrBadCode)
-		}
-		c, br, did, err := a.openSession(hello{Role: "desktop", Code: np})
-		if err != nil {
-			return err
-		}
-		_, peer, err := clientHandshake(c, br, initiatorParams{id: key, mode: "pair", secret: secret, nameplate: np})
-		c.Close()
-		if err != nil {
-			return fmt.Errorf("%w: %w", errDenied, err)
-		}
-		if err := savePeer(cfg.State, did, peer); err != nil {
-			return err
-		}
-		id = did
-		cfg.Events("paired", map[string]any{"device_id": id})
-	}
-	if cfg.Mode != "corporate" {
-		pinned, err := loadPeer(cfg.State, id)
+	return a, params, nil
+}
+
+// pin fixes the device id and, in solo mode, the device key it must present.
+func (a *desktopAgent) pin(params *initiatorParams, id string) error {
+	if a.mode != "corporate" {
+		pinned, err := loadPeer(a.state, id)
 		if err != nil {
 			return fmt.Errorf("%w: %w: %q", errDenied, ErrNotPaired, id)
 		}
 		params.pinnedPeer = pinned
 	}
 	a.deviceID = id
-	// verify the device is reachable and still trusts us before exposing a port
-	c, br, rep0, err := a.openSessionRep(hello{Role: "desktop", DeviceID: id})
-	if err != nil {
-		return err
+	return nil
+}
+
+func (a *desktopAgent) closeAll(reason string) {
+	a.mu.Lock()
+	ts := make([]*tunnel, 0, len(a.tunnels))
+	for t := range a.tunnels {
+		ts = append(ts, t)
 	}
-	lan := rep0.LAN
-	_, _, err = clientHandshake(c, br, params)
-	c.Close()
-	if err != nil {
-		return fmt.Errorf("%w: %v", errDenied, err)
-	}
-	ln, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		return err
-	}
-	stop := context.AfterFunc(ctx, func() {
-		ln.Close()
-		a.mu.Lock()
-		for t := range a.tunnels {
+	a.mu.Unlock()
+	for _, t := range ts {
+		if reason != "" {
+			t.closeWith(reason)
+		} else {
 			t.close()
 		}
-		a.mu.Unlock()
-	})
-	defer stop()
-	cfg.Events("listening", map[string]any{"addr": ln.Addr().String(), "device_id": id})
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return err
-		}
-		go a.serveADB(conn, id, lan, params)
 	}
+}
+
+// PairADB tunnels Android 11+ Wireless-debugging pairing (adb pair,
+// _adb-tls-pairing._tcp) to a paired (solo) or granted (corporate) device, so
+// a desktop that is not on the phone's network can pair its adb key. It
+// authenticates to the device exactly like an adb session, exposes the
+// phone's pairing service on a loopback port, and calls pair with that
+// address. The pairing code is only ever seen by pair (adb) and by the phone.
+func PairADB(ctx context.Context, cfg DesktopConfig, pairingPort int, pair func(ctx context.Context, addr string) error) (transport string, err error) {
+	if pairingPort < 0 || pairingPort > 65535 {
+		return "", fmt.Errorf("%w: pairing port %d out of range", errDenied, pairingPort)
+	}
+	if cfg.Device == "" {
+		return "", fmt.Errorf("%w: a device id is required", errDenied)
+	}
+	a, params, err := newDesktop(ctx, &cfg)
+	if err != nil {
+		return "", err
+	}
+	if err := a.pin(&params, cfg.Device); err != nil {
+		return "", err
+	}
+	params.target = "adb-pair:" + strconv.Itoa(pairingPort)
+	// Establish first: unsupported or unauthorised devices fail here with a
+	// typed error instead of an opaque adb pair failure.
+	sc, path, err := a.establishPatiently(cfg.Device, "", params)
+	if err != nil {
+		return "", err
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		sc.Close()
+		return "", err
+	}
+	pctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	var reasonMu sync.Mutex
+	var peerReason string
+	first := make(chan *secureConn, 1)
+	first <- sc
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var s *secureConn
+			select {
+			case s = <-first:
+			default:
+				if s, _, err = a.establish(cfg.Device, "", params); err != nil {
+					conn.Close()
+					continue
+				}
+			}
+			t := newTunnel(s, conn, true)
+			a.mu.Lock()
+			a.tunnels[t] = struct{}{}
+			a.mu.Unlock()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				t.run(func(t *tunnel) (string, error) { return a.rejoin(cfg.Device, "", t) })
+				a.mu.Lock()
+				delete(a.tunnels, t)
+				a.mu.Unlock()
+				if r := t.PeerReason(); r != "" {
+					reasonMu.Lock()
+					peerReason = r
+					reasonMu.Unlock()
+				}
+			}()
+		}
+	}()
+	a.record(audit.Event{"event": "adb_pair_start", "transport": path, "pairing_port": pairingPort})
+	perr := pair(pctx, ln.Addr().String())
+	ln.Close()
+	select {
+	case s := <-first: // adb never connected
+		s.Close()
+	default:
+	}
+	a.closeAll("")
+	wg.Wait()
+	reasonMu.Lock()
+	why := peerReason
+	reasonMu.Unlock()
+	if perr != nil {
+		if why != "" && why != "closed" {
+			perr = fmt.Errorf("%w (device: %s)", perr, why)
+		}
+		a.record(audit.Event{"event": "adb_pair_end", "transport": path, "pairing_port": pairingPort, "result": "failed"})
+		return path, fmt.Errorf("%w: %w", ErrADBPairFailed, perr)
+	}
+	a.record(audit.Event{"event": "adb_pair_end", "transport": path, "pairing_port": pairingPort, "result": "ok"})
+	return path, nil
 }
 
 // serveADB carries one adb host connection to the device.
@@ -186,14 +379,23 @@ func (a *desktopAgent) serveADB(conn net.Conn, id, lan string, params initiatorP
 		a.record(audit.Event{"event": "session_start", "session": obs.session, "transport": path})
 	}
 	t := newTunnel(sc, accelerate(local), true)
+	t.observe(path, a.events)
 	a.mu.Lock()
 	a.tunnels[t] = struct{}{}
 	a.mu.Unlock()
 	started := time.Now()
-	t.run(func(t *tunnel) error { return a.rejoin(id, lan, t) })
+	t.run(func(t *tunnel) (string, error) { return a.rejoin(id, lan, t) })
 	a.mu.Lock()
 	delete(a.tunnels, t)
 	a.mu.Unlock()
+	switch why := t.PeerReason(); why {
+	case "":
+	case "session_expired":
+		// The device's clock reached the cap first: it is authoritative.
+		a.terminate(fmt.Errorf("%w: %w: ended by the device; connect again to re-authenticate", errDenied, ErrSessionExpired), why)
+	default:
+		a.terminate(fmt.Errorf("%w: %w: %s", errDenied, ErrPeerClosed, why), "peer_closed", "peer_reason", why)
+	}
 	if obs != nil {
 		obs.finish()
 		up, down := obs.totals()
@@ -202,17 +404,43 @@ func (a *desktopAgent) serveADB(conn net.Conn, id, lan string, params initiatorP
 	}
 }
 
+// currentToken is the corporate token to present now (it may have been
+// rotated since the session started).
+func (a *desktopAgent) currentToken() string {
+	if a.tokenFn != nil {
+		if t := a.tokenFn(); t != "" {
+			return t
+		}
+	}
+	return a.token
+}
+
+// identity returns the audit identity (subject and token id, never the
+// token), following token rotation.
+func (a *desktopAgent) identity() (user, tokenID string) {
+	a.idMu.Lock()
+	defer a.idMu.Unlock()
+	if tok := a.currentToken(); a.pol != nil && tok != a.auditTok {
+		a.auditTok = tok
+		if cl, err := a.pol.verifyToken(tok, "user", a.key.Public().(ed25519.PublicKey)); err == nil {
+			a.user, a.tokenID = cl.Sub, cl.Jti
+		}
+	}
+	return a.user, a.tokenID
+}
+
 func (a *desktopAgent) record(e audit.Event) {
 	if a.audit == nil {
 		return
 	}
 	e["role"] = "desktop"
 	e["device"] = a.deviceID
-	if a.user != "" {
-		e["user"] = a.user
+	user, tokenID := a.identity()
+	if user != "" {
+		e["user"] = user
 	}
-	if a.tokenID != "" {
-		e["token_id"] = a.tokenID
+	if tokenID != "" {
+		e["token_id"] = tokenID
 	}
 	if err := a.audit.Write(e); err != nil {
 		logf("audit write failed: %v", err)
@@ -258,7 +486,7 @@ func (a *desktopAgent) establishPatiently(id, lan string, params initiatorParams
 			}
 			return sc, path, nil
 		}
-		if errors.Is(err, errDenied) || time.Now().Add(backoff).After(deadline) {
+		if errors.Is(err, errDenied) || a.ctx.Err() != nil || time.Now().Add(backoff).After(deadline) {
 			return nil, "", err
 		}
 		if attempt == 1 {
@@ -297,25 +525,26 @@ func (a *desktopAgent) establish(id, lan string, params initiatorParams) (*secur
 	return sc, TransportLabel(a.relayAddr), nil
 }
 
-// rejoin re-attaches an existing tunnel after the underlying path broke.
-func (a *desktopAgent) rejoin(id, lan string, t *tunnel) error {
+// rejoin re-attaches an existing tunnel after the underlying path broke and
+// reports the transport it used (lan or a relay label).
+func (a *desktopAgent) rejoin(id, lan string, t *tunnel) (string, error) {
 	if lan != "" {
 		if dc, err := net.DialTimeout("tcp", lan, 700*time.Millisecond); err == nil {
 			if err := clientRejoin(dc, dc, t); err == nil {
-				return nil
+				return "lan", nil
 			}
 			dc.Close()
 		}
 	}
 	c, br, _, err := a.openSession(hello{Role: "desktop", DeviceID: id})
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := clientRejoin(c, br, t); err != nil {
 		c.Close()
-		return err
+		return "", err
 	}
-	return nil
+	return TransportLabel(a.relayAddr), nil
 }
 
 func (a *desktopAgent) openSession(h hello) (net.Conn, *bufio.Reader, string, error) {
@@ -325,12 +554,19 @@ func (a *desktopAgent) openSession(h hello) (net.Conn, *bufio.Reader, string, er
 
 // openSessionRep asks the relay for a spliced stream to the device.
 func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, error) {
-	c, err := a.dial(a.relayAddr)
+	if err := a.ctx.Err(); err != nil {
+		return nil, nil, reply{}, err
+	}
+	rc, err := a.dial(a.relayAddr)
 	if err != nil {
 		return nil, nil, reply{}, err
 	}
+	// Cancelling the session (session.cancel, Stop) must not wait for a
+	// stalled relay or handshake to time out.
+	c := &ctxConn{Conn: rc}
+	c.stop = context.AfterFunc(a.ctx, func() { rc.Close() })
 	br := bufio.NewReader(c)
-	h.Identity = a.token
+	h.Identity = a.currentToken()
 	// A relay that accepts the connection but never answers must not hang
 	// the caller: bound the whole rendezvous exchange.
 	c.SetDeadline(time.Now().Add(rendezvousTimeout))
@@ -359,6 +595,14 @@ func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, 
 	return c, br, rep, nil
 }
 
+// ctxConn closes with its owner's context.
+type ctxConn struct {
+	net.Conn
+	stop func() bool
+}
+
+func (c *ctxConn) Close() error { c.stop(); return c.Conn.Close() }
+
 func peerPath(state, id string) string {
 	return filepath.Join(state, "peers", base64.RawURLEncoding.EncodeToString([]byte(id)))
 }
@@ -380,4 +624,33 @@ func loadPeer(state, id string) (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("corrupt pin")
 	}
 	return ed25519.PublicKey(k), nil
+}
+
+// Presence asks the corporate relay which of the devices granted to this
+// user are online. It authenticates with the user token and proof of
+// possession like a session open, and touches no device.
+func Presence(ctx context.Context, cfg DesktopConfig) ([]DevicePresence, error) {
+	if cfg.Mode != "corporate" || cfg.Identity == "" {
+		return nil, fmt.Errorf("%w: presence needs corporate mode and an identity token", errDenied)
+	}
+	if cfg.Dial == nil {
+		cfg.Dial = cfg.Transport.Dialer()
+	}
+	if cfg.State == "" {
+		cfg.State = "."
+	}
+	key, err := loadOrCreateKey(cfg.State)
+	if err != nil {
+		return nil, err
+	}
+	a := &desktopAgent{relayAddr: cfg.Relay, key: key, token: cfg.Identity, tokenFn: cfg.Token, dial: cfg.Dial, ctx: ctx}
+	c, _, rep, err := a.openSessionRep(hello{Role: "presence"})
+	if err != nil {
+		return nil, err
+	}
+	c.Close()
+	if rep.Devices == nil {
+		rep.Devices = []DevicePresence{}
+	}
+	return rep.Devices, nil
 }

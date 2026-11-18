@@ -57,6 +57,13 @@ public sealed interface ConnectionState {
         val adbdEndpoint: String? = null,
         /** A non-fatal problem, e.g. Wireless debugging is switched off. */
         val warning: String? = null,
+        /**
+         * The latest path transition of a desktop session (v1.1.0+): DOWN when
+         * keepalives are missed or the connection breaks, UP when the 90 s
+         * rejoin succeeds (with the transport it used), LOST when the rejoin
+         * window expires. Null until the first transition.
+         */
+        val path: PathStatus? = null,
     ) : ConnectionState
 
     /** The agent stopped unexpectedly and will be restarted. */
@@ -73,6 +80,50 @@ public sealed interface ConnectionState {
      */
     public data class PolicyMissing(val missing: String) : ConnectionState
 }
+
+/** State of a session's network path (v1.1.0+). */
+public enum class PathState {
+    /** Rejoined after an outage. */
+    UP,
+
+    /** Keepalives missed or the connection broke; rejoining for up to 90 s. */
+    DOWN,
+
+    /** The rejoin window expired; the session's adb stream has closed. */
+    LOST,
+}
+
+/** One path transition reported by the agent for a desktop session. */
+public data class PathStatus(
+    /** Short session id, the same on the desktop (`session_id`) and in audit records. */
+    val sessionId: String,
+    val state: PathState,
+    /** lan | relay-tcp | relay-ws | relay-wss (UP and DOWN). */
+    val transport: String? = null,
+    /** Why the path went DOWN or was LOST, e.g. keepalive_timeout, rejoin_window_expired. */
+    val reason: String? = null,
+    /** How long the path was down (UP and LOST). */
+    val outageMs: Long? = null,
+)
+
+/**
+ * A desktop session served by this device (v1.1.0+), from the agent's
+ * session_open event until its session_close.
+ */
+public data class DeviceSession(
+    /** Short session id, the same on the desktop (`session_id` in path events) and in audit records. */
+    val id: String,
+    /** Who is connected: the desktop's label, the corporate user, or a key fingerprint. */
+    val peerLabel: String,
+    /** lan | relay-tcp | relay-ws | relay-wss (updated when the path changes). */
+    val transport: String,
+    /** "adb" for a debugging session, "adb-pair" while a desktop pairs its adb key. */
+    val kind: String = "adb",
+    /** When the session opened (epoch milliseconds). */
+    val openedAtMs: Long = 0,
+    /** Current path state; UP until a path_down. */
+    val path: PathState = PathState.UP,
+)
 
 /** Effective policy after merging the app config with device management. */
 public data class PolicyStatus(
@@ -91,7 +142,7 @@ public data class AuditEvent(
     val seq: Long,
     /** RFC 3339 UTC. */
     val timestamp: String,
-    /** agent_start, pairing_code_issued, online, adbd_endpoint, adbd_unreachable, blocked, policy_missing, agent_error, agent_exit, agent_stop. */
+    /** agent_start, pairing_code_issued, online, adbd_endpoint, adbd_unreachable, blocked, policy_missing, agent_error, agent_exit, agent_stop; v1.1.0: path_down, path_up, path_lost. */
     val type: String,
     val deviceId: String?,
     /** Extra fields (never secrets, tokens or pairing codes). */

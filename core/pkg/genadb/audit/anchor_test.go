@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -66,8 +67,14 @@ func TestAnchoredLogVerifies(t *testing.T) {
 	if _, err := os.Stat(AnchorPath(path)); err != nil {
 		t.Fatalf("no anchor written: %v", err)
 	}
-	if fi, err := os.Stat(DefaultAnchorKeyPath(path)); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Fatalf("anchor key: %v %v", fi, err)
+	fi, err := os.Stat(DefaultAnchorKeyPath(path))
+	if err != nil {
+		t.Fatalf("anchor key: %v", err)
+	}
+	// Windows has no POSIX mode bits (os.Stat reports 0666 or 0444; access
+	// is governed by the profile directory's ACL), so only Unix can check 0600.
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Fatalf("anchor key mode %v, want 0600", fi.Mode())
 	}
 }
 

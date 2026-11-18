@@ -230,7 +230,7 @@ func (r *relay) serveWebSocket(addr, certFile, keyFile string) (net.Listener, er
 		c.SetReadLimit(-1)
 		go wsKeepalive(c)
 		nc := websocket.NetConn(context.Background(), c, websocket.MessageBinary)
-		r.handle(&wsConn{Conn: nc, remote: remote})
+		r.handle(&wsConn{Conn: nc, remote: remote, tls: req.TLS != nil})
 	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
@@ -247,6 +247,18 @@ func (r *relay) serveWebSocket(addr, certFile, keyFile string) (net.Listener, er
 type wsConn struct {
 	net.Conn
 	remote string
+	tls    bool
+}
+
+// relayTransport names how a client reached the relay: tcp, ws or wss.
+func relayTransport(c net.Conn) string {
+	if w, ok := c.(*wsConn); ok {
+		if w.tls {
+			return "wss"
+		}
+		return "ws"
+	}
+	return "tcp"
 }
 
 func (w *wsConn) RemoteAddr() net.Addr { return wsAddr(w.remote) }

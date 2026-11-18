@@ -164,3 +164,52 @@ func TestSinceFilter(t *testing.T) {
 		t.Fatalf("since filter: %+v", r.Totals)
 	}
 }
+
+// Windows: a log held open by a writer must not block rotation, renaming
+// the archive away, or deleting the directory (the v1.1.0 Windows fix; on
+// Unix this always held). The writer follows the rotation to the new file.
+func TestOpenWriterDoesNotBlockRenameOrDelete(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	w, err := OpenFileWith(path, FileOptions{AnchorKey: []byte("k")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.Write(Event{"event": "one"}); err != nil {
+		t.Fatal(err)
+	}
+	// Rotate while w still holds the log open.
+	archive := filepath.Join(dir, "audit-1.jsonl")
+	if err := RotateFile(path, archive, FileOptions{AnchorKey: []byte("k")}); err != nil {
+		t.Fatalf("rotate with an open writer: %v", err)
+	}
+	if err := w.Write(Event{"event": "two"}); err != nil {
+		t.Fatalf("write after rotation: %v", err)
+	}
+	evs, err := ReadFile(path)
+	if err != nil || len(evs) != 1 || evs[0]["event"] != "two" || seqOf(evs[0]) != 2 {
+		t.Fatalf("new log %v %v", evs, err)
+	}
+	// RotateFile released its handle on the archive: it can be moved away.
+	moved := filepath.Join(dir, "moved.jsonl")
+	if err := os.Rename(archive, moved); err != nil {
+		t.Fatalf("archive still held open: %v", err)
+	}
+	// The live log can be deleted while w still has it open.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("delete of an open log: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := w.Write(Event{"event": "late"}); err == nil {
+		t.Fatal("write after Close succeeded")
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+}

@@ -14,6 +14,12 @@ public interface AgentProcess {
 
     /** Terminates the process; must unblock [readLine]. */
     public fun destroy()
+
+    /**
+     * Sends one command line to the agent's stdin (v1.1.0+, e.g. ending a
+     * session). Returns false when the process cannot take commands.
+     */
+    public fun writeLine(line: String): Boolean = false
 }
 
 /** Starts the connectivity agent. Replace it in tests or to host the agent elsewhere. */
@@ -32,11 +38,15 @@ public class ProcessAgentLauncher(
         pb.environment().putAll(env)
         val p = pb.start()
         val reader = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8))
+        val writer = p.outputStream.bufferedWriter(Charsets.UTF_8)
         return object : AgentProcess {
             override fun readLine(): String? = runCatching { reader.readLine() }.getOrNull()
             override fun waitFor(): Int = p.waitFor()
             override fun destroy() {
                 p.destroy()
+            }
+            override fun writeLine(line: String): Boolean = synchronized(writer) {
+                runCatching { writer.write(line); writer.newLine(); writer.flush() }.isSuccess
             }
         }
     }
