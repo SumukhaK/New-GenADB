@@ -27,6 +27,7 @@ type desktopAgent struct {
 	audit                   audit.Sink
 	user, tokenID, deviceID string
 
+	ctx      context.Context // closes relay streams still being set up when cancelled
 	mode     string
 	pol      *policy
 	tokenFn  func() string
@@ -67,7 +68,7 @@ type DesktopConfig struct {
 // adb endpoint and tunnels every adb connection to the device until ctx is
 // cancelled. It returns ctx.Err() after a clean shutdown.
 func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
-	a, params, err := newDesktop(&cfg)
+	a, params, err := newDesktop(ctx, &cfg)
 	if err != nil {
 		return err
 	}
@@ -130,7 +131,7 @@ func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
 
 // newDesktop loads the identity and builds the handshake parameters shared
 // by every stream to the device (corporate checks included).
-func newDesktop(cfg *DesktopConfig) (*desktopAgent, initiatorParams, error) {
+func newDesktop(ctx context.Context, cfg *DesktopConfig) (*desktopAgent, initiatorParams, error) {
 	if cfg.Listen == "" {
 		cfg.Listen = "127.0.0.1:0"
 	}
@@ -151,7 +152,7 @@ func newDesktop(cfg *DesktopConfig) (*desktopAgent, initiatorParams, error) {
 		return nil, initiatorParams{}, err
 	}
 	a := &desktopAgent{relayAddr: cfg.Relay, state: cfg.State, key: key, token: cfg.Identity, dial: cfg.Dial,
-		events: cfg.Events, audit: cfg.Audit, tunnels: map[*tunnel]struct{}{}, mode: cfg.Mode}
+		events: cfg.Events, audit: cfg.Audit, tunnels: map[*tunnel]struct{}{}, mode: cfg.Mode, ctx: ctx}
 	a.tokenFn = cfg.Token
 	params := initiatorParams{id: key, mode: "resume", token: cfg.Identity, tokenFn: cfg.Token, label: cleanReason([]byte(cfg.Label))}
 	if cfg.Mode == "corporate" {
@@ -226,7 +227,7 @@ func PairADB(ctx context.Context, cfg DesktopConfig, pairingPort int, pair func(
 	if cfg.Device == "" {
 		return "", fmt.Errorf("%w: a device id is required", errDenied)
 	}
-	a, params, err := newDesktop(&cfg)
+	a, params, err := newDesktop(ctx, &cfg)
 	if err != nil {
 		return "", err
 	}
@@ -424,7 +425,7 @@ func (a *desktopAgent) establishPatiently(id, lan string, params initiatorParams
 			}
 			return sc, path, nil
 		}
-		if errors.Is(err, errDenied) || time.Now().Add(backoff).After(deadline) {
+		if errors.Is(err, errDenied) || a.ctx.Err() != nil || time.Now().Add(backoff).After(deadline) {
 			return nil, "", err
 		}
 		if attempt == 1 {
@@ -491,10 +492,17 @@ func (a *desktopAgent) openSession(h hello) (net.Conn, *bufio.Reader, string, er
 
 // openSessionRep asks the relay for a spliced stream to the device.
 func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, error) {
-	c, err := a.dial(a.relayAddr)
+	if err := a.ctx.Err(); err != nil {
+		return nil, nil, reply{}, err
+	}
+	rc, err := a.dial(a.relayAddr)
 	if err != nil {
 		return nil, nil, reply{}, err
 	}
+	// Cancelling the session (session.cancel, Stop) must not wait for a
+	// stalled relay or handshake to time out.
+	c := &ctxConn{Conn: rc}
+	c.stop = context.AfterFunc(a.ctx, func() { rc.Close() })
 	br := bufio.NewReader(c)
 	h.Identity = a.currentToken()
 	// A relay that accepts the connection but never answers must not hang
@@ -524,6 +532,14 @@ func (a *desktopAgent) openSessionRep(h hello) (net.Conn, *bufio.Reader, reply, 
 	}
 	return c, br, rep, nil
 }
+
+// ctxConn closes with its owner's context.
+type ctxConn struct {
+	net.Conn
+	stop func() bool
+}
+
+func (c *ctxConn) Close() error { c.stop(); return c.Conn.Close() }
 
 func peerPath(state, id string) string {
 	return filepath.Join(state, "peers", base64.RawURLEncoding.EncodeToString([]byte(id)))

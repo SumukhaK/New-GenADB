@@ -13,10 +13,11 @@ import (
 )
 
 type rpc struct {
-	t  *testing.T
-	c  net.Conn
-	sc *bufio.Scanner
-	id int
+	t       *testing.T
+	c       net.Conn
+	sc      *bufio.Scanner
+	id      int
+	pending map[string]map[string]any // replies read while awaiting another
 }
 
 func (r *rpc) call(method string, params any) map[string]any {

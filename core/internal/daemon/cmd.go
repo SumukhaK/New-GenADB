@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -25,7 +27,13 @@ import (
 // on loopback TCP with the token stored in <state>/daemon.token, or serving a
 // single client over stdin/stdout with --stdio.
 func Main(name string, args []string) int {
-	if err := run(name, args); err != nil && !errors.Is(err, context.Canceled) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	err := run(ctx, name, args, os.Stdout)
+	if errors.Is(err, flag.ErrHelp) {
+		return 0
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintln(os.Stderr, name+":", err)
 		return 1
 	}
@@ -37,8 +45,19 @@ type stdio struct{}
 func (stdio) Read(p []byte) (int, error)  { return os.Stdin.Read(p) }
 func (stdio) Write(p []byte) (int, error) { return os.Stdout.Write(p) }
 
-func run(name string, args []string) error {
-	fl := flag.NewFlagSet(name, flag.ExitOnError)
+// ReadyEvent is the single JSON line the daemon prints on stdout once its
+// TCP listener is bound, so a parent process (Setu-Desktop, an IDE plugin)
+// knows when and where to connect without polling or parsing stderr.
+type ReadyEvent struct {
+	Event     string `json:"event"` // "daemon_ready"
+	Listen    string `json:"listen"`
+	Version   string `json:"version"`
+	TokenFile string `json:"token_file"`
+	PID       int    `json:"pid"`
+}
+
+func run(ctx context.Context, name string, args []string, stdout io.Writer) error {
+	fl := flag.NewFlagSet(name, flag.ContinueOnError)
 	listen := fl.String("listen", "127.0.0.1:7605", "loopback address for JSON-RPC clients")
 	useStdio := fl.Bool("stdio", false, "serve one client on stdin/stdout instead of TCP (no token)")
 	state := fl.String("state", "", "state directory (default: user config dir/genadb, shared by setu and genadb)")
@@ -57,7 +76,9 @@ func run(name string, args []string) error {
 	fl.StringVar(&t.Proxy, "proxy", "", "HTTP proxy for ws/wss relays")
 	fl.StringVar(&t.CAFile, "relay-ca", "", "PEM CA/certificate to trust for wss relays")
 	fl.StringVar(&t.Pin, "relay-pin", "", "hex SHA-256 relay certificate pin")
-	fl.Parse(args)
+	if err := fl.Parse(args); err != nil {
+		return err
+	}
 
 	srv := &Server{}
 	opts := []genadb.Option{genadb.WithRelayURL(*relay), genadb.WithTransportOptions(t),
@@ -114,8 +135,6 @@ func run(name string, args []string) error {
 	defer c.Close()
 	srv.Client = c
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	if *mode == "corporate" {
 		// Rotating the identity file rotates the token of live sessions.
 		go c.WatchIdentityFile(ctx, *identityFile, 2*time.Second)
@@ -140,6 +159,11 @@ func run(name string, args []string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "%s %s listening on %s (token in %s)\n", name, genadb.Version, ln.Addr(), path)
+	b, _ := json.Marshal(ReadyEvent{Event: "daemon_ready", Listen: ln.Addr().String(), Version: genadb.Version, TokenFile: path, PID: os.Getpid()})
+	if _, err := stdout.Write(append(b, '\n')); err != nil {
+		ln.Close()
+		return err
+	}
 	return srv.Listen(ctx, ln)
 }
 
