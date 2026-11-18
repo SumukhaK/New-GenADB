@@ -155,10 +155,11 @@ func echoServer(t *testing.T) string {
 }
 
 type pathWorld struct {
-	proxy         *cutProxy
-	desk, dev     *evLog
-	local         net.Conn
-	deviceSession string
+	proxy     *cutProxy
+	desk, dev *evLog
+	local     net.Conn
+	cmds      chan DeviceCommand
+	deskDone  chan error
 }
 
 // startPathWorld runs relay, device (adbd = echo) and a desktop that reaches
@@ -177,9 +178,9 @@ func startPathWorld(t *testing.T, times tunnelTimes) *pathWorld {
 		}
 	}})
 	relay := <-ready
-	w := &pathWorld{desk: &evLog{}, dev: &evLog{}}
+	w := &pathWorld{desk: &evLog{}, dev: &evLog{}, cmds: make(chan DeviceCommand), deskDone: make(chan error, 1)}
 	codes := make(chan string, 4)
-	go RunDevice(ctx, DeviceConfig{Relay: relay, ADBD: echoServer(t), State: t.TempDir(), DebugAllowed: true,
+	go RunDevice(ctx, DeviceConfig{Relay: relay, ADBD: echoServer(t), State: t.TempDir(), DebugAllowed: true, Commands: w.cmds,
 		Events: func(ev string, f map[string]any) {
 			if ev == "pairing_code" {
 				codes <- f["code"].(string)
@@ -194,13 +195,15 @@ func startPathWorld(t *testing.T, times tunnelTimes) *pathWorld {
 	}
 	w.proxy = newCutProxy(t, relay)
 	listening := make(chan string, 1)
-	go RunDesktop(ctx, DesktopConfig{Relay: w.proxy.addr(), State: t.TempDir(), Code: code,
-		Events: func(ev string, f map[string]any) {
-			if ev == "listening" {
-				listening <- f["addr"].(string)
-			}
-			w.desk.fn(ev, f)
-		}})
+	go func() {
+		w.deskDone <- RunDesktop(ctx, DesktopConfig{Relay: w.proxy.addr(), State: t.TempDir(), Code: code, Label: "ci-laptop",
+			Events: func(ev string, f map[string]any) {
+				if ev == "listening" {
+					listening <- f["addr"].(string)
+				}
+				w.desk.fn(ev, f)
+			}})
+	}()
 	var addr string
 	select {
 	case addr = <-listening:

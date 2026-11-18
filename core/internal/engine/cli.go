@@ -1,10 +1,13 @@
 package engine
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -108,12 +111,47 @@ func cliDevice(ctx context.Context, args []string) error {
 	AddTransportFlags(fs, &c.Transport)
 	fs.StringVar(&c.LANListen, "lan-listen", "", "LAN listen address (solo: direct path)")
 	fs.StringVar(&c.LANAdvertise, "lan-advertise", "", "LAN address to advertise (default: lan-listen)")
+	control := fs.Bool("control-stdin", false, `read JSON commands from stdin, one per line: {"cmd":"end_session","session_id":"..."}`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	c.DebugAllowed = *debugPolicy == "allowed"
 	c.Events = StdoutEvents
+	if *control {
+		c.Commands = readCommands(ctx, os.Stdin, StdoutEvents)
+	}
 	return RunDevice(ctx, c)
+}
+
+// readCommands turns JSON lines from r into device commands and reports
+// each outcome as a command_result event.
+func readCommands(ctx context.Context, r io.Reader, events EventFunc) <-chan DeviceCommand {
+	out := make(chan DeviceCommand)
+	go func() {
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			var m struct {
+				Cmd       string `json:"cmd"`
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal(sc.Bytes(), &m) != nil || m.Cmd == "" {
+				continue
+			}
+			reply := make(chan error, 1)
+			select {
+			case out <- DeviceCommand{Op: m.Cmd, SessionID: m.SessionID, Reply: reply}:
+			case <-ctx.Done():
+				return
+			}
+			err := <-reply
+			f := map[string]any{"cmd": m.Cmd, "session_id": m.SessionID, "ok": err == nil}
+			if err != nil {
+				f["error"] = err.Error()
+			}
+			events("command_result", f)
+		}
+	}()
+	return out
 }
 
 func cliConnect(ctx context.Context, args []string) error {

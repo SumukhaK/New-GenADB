@@ -11,13 +11,15 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import dev.genadb.sdk.ConnectionState
+import dev.genadb.sdk.NotificationContent
 import dev.genadb.sdk.SetuConfig
 import dev.genadb.sdk.SetuManager
+import dev.genadb.sdk.SetuNotifications
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 /**
@@ -54,7 +56,10 @@ class AgentService : Service() {
         val filter = IntentFilter(Intent.ACTION_APPLICATION_RESTRICTIONS_CHANGED)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(restrictionsChanged, filter, RECEIVER_NOT_EXPORTED)
         else registerReceiver(restrictionsChanged, filter)
-        scope.launch { setu.connectionState.collect { notify(text(it)) } }
+        scope.launch {
+            combine(setu.connectionState, setu.sessions, SetuNotifications::content)
+                .collect { notify(it) }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -68,26 +73,34 @@ class AgentService : Service() {
         return START_STICKY
     }
 
-    private fun text(s: ConnectionState): String = when (s) {
-        is ConnectionState.Blocked -> "Blocked by device policy"
-        is ConnectionState.PolicyMissing -> "Waiting for device management (${s.missing} missing)"
-        is ConnectionState.Online -> s.pairingCode?.let { "Online · pairing code $it" } ?: "Online"
-        is ConnectionState.Reconnecting -> s.reason ?: "Reconnecting…"
-        ConnectionState.Starting -> "Starting…"
-        ConnectionState.Idle -> "Stopped"
-    }
+    private fun notify(text: String) = notify(plain(text))
 
-    private fun notify(text: String) =
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(1, notification(text))
+    private fun notify(c: NotificationContent) =
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(1, notification(c))
 
-    private fun notification(text: String): Notification {
+    private fun notification(text: String): Notification = notification(plain(text))
+
+    private fun plain(text: String) = NotificationContent("Setu remote debugging", text, text, false)
+
+    /**
+     * The full text (which may hold the 10-digit pairing code) is only shown on an
+     * unlocked device. The lock screen gets a public version without the code.
+     */
+    private fun notification(c: NotificationContent): Notification {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(NotificationChannel("agent", "Remote debugging", NotificationManager.IMPORTANCE_LOW))
+        val public = Notification.Builder(this, "agent")
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setContentTitle(c.title)
+            .setContentText(c.publicText)
+            .build()
         return Notification.Builder(this, "agent")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("Setu remote debugging")
-            .setContentText(text)
+            .setContentTitle(c.title)
+            .setContentText(c.text)
             .setOngoing(true)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setPublicVersion(public)
             .build()
     }
 

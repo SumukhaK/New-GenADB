@@ -92,7 +92,7 @@ type relay struct {
 	limits         *limiter
 	pendingBy      map[string]int // device id -> session opens awaiting the device
 	trustForwarded bool
-	revFile        string     // persisted revocations ("" = memory only)
+	revFile        string // persisted revocations ("" = memory only)
 	policyPath     string
 	persistMu      sync.Mutex // serialises writes of revFile
 }

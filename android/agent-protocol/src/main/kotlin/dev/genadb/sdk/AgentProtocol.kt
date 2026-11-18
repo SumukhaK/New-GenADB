@@ -91,6 +91,7 @@ internal fun agentArgs(e: EffectiveConfig, stateDir: String, policyFile: String?
     }
     e.relayPin?.let { add("--relay-pin"); add(it) }
     c.proxy?.let { add("--proxy"); add(it) }
+    add("--control-stdin") // SetuManager.endSession
 }
 
 /** Classifies a relay spec the way the Go core does for audit records. */
@@ -109,6 +110,8 @@ internal sealed interface AgentEvent {
     data class AdbdUnreachable(val reason: String) : AgentEvent
     data class Error(val reason: String) : AgentEvent
     data class Path(val status: PathStatus) : AgentEvent
+    data class SessionOpen(val sessionId: String, val peerLabel: String, val transport: String, val kind: String) : AgentEvent
+    data class SessionClose(val sessionId: String, val reason: String) : AgentEvent
     data class Other(val name: String) : AgentEvent
 
     companion object {
@@ -121,6 +124,9 @@ internal sealed interface AgentEvent {
                 "adbd_endpoint" -> AdbdEndpoint(o.optString("addr"))
                 "adbd_unreachable" -> AdbdUnreachable(o.optString("reason"))
                 "error" -> Error(o.optString("reason"))
+                "session_open" -> SessionOpen(o.optString("session_id"), o.optString("peer_label"),
+                    o.optString("transport"), o.optString("kind", "adb"))
+                "session_close" -> SessionClose(o.optString("session_id"), o.optString("reason"))
                 "path_down", "path_up", "path_lost" -> Path(
                     PathStatus(
                         sessionId = o.optString("session_id"),
@@ -160,7 +166,7 @@ internal data class AgentView(
         is AgentEvent.AdbdUnreachable -> copy(warning = "Wireless debugging unreachable: ${e.reason}")
         is AgentEvent.Error -> copy(online = false, lastError = e.reason)
         is AgentEvent.Path -> copy(path = e.status)
-        is AgentEvent.Other -> this
+        is AgentEvent.SessionOpen, is AgentEvent.SessionClose, is AgentEvent.Other -> this
     }
 
     fun state(): ConnectionState = when {
@@ -184,5 +190,24 @@ internal fun auditFor(e: AgentEvent): Pair<String, Map<String, String>>? = when 
         e.status.reason?.let { put("reason", it) }
         e.status.outageMs?.let { put("outage_ms", it.toString()) }
     }
+    is AgentEvent.SessionOpen -> "session_open" to mapOf("session_id" to e.sessionId, "peer_label" to e.peerLabel,
+        "transport" to e.transport, "kind" to e.kind)
+    is AgentEvent.SessionClose -> "session_close" to mapOf("session_id" to e.sessionId, "reason" to e.reason)
     is AgentEvent.Other -> null
 }
+
+/** Folds session and path events into the list of open sessions. */
+internal fun List<DeviceSession>.apply(e: AgentEvent, nowMs: Long): List<DeviceSession> = when (e) {
+    is AgentEvent.SessionOpen -> filterNot { it.id == e.sessionId } +
+        DeviceSession(e.sessionId, e.peerLabel, e.transport, e.kind, nowMs)
+    is AgentEvent.SessionClose -> filterNot { it.id == e.sessionId }
+    is AgentEvent.Path -> map {
+        if (it.id != e.status.sessionId) it
+        else it.copy(path = e.status.state, transport = e.status.transport ?: it.transport)
+    }
+    else -> this
+}
+
+/** The command line asking the agent to end a session. */
+internal fun endSessionCommand(id: String): String =
+    JSONObject().put("cmd", "end_session").put("session_id", id).toString()

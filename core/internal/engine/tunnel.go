@@ -87,6 +87,24 @@ type tunnel struct {
 	onPath    EventFunc
 	downAt    time.Time // when the path went down (zero = up)
 	transport string    // transport of the current connection
+	lost      bool      // the rejoin window expired or the rejoin was refused
+	localWhy  string    // reason this side gave to closeWith
+}
+
+// endReason says why a finished tunnel ended: the reason this side gave,
+// peer_closed, path_lost or closed (a normal end of the adb stream).
+func (t *tunnel) endReason() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch {
+	case t.localWhy != "":
+		return t.localWhy
+	case t.peerReason != "":
+		return "peer_closed"
+	case t.lost:
+		return "path_lost"
+	}
+	return "closed"
 }
 
 // ID is the short session id shared by both ends (and by audit records).
@@ -127,6 +145,7 @@ func (t *tunnel) pathUp(transport string) {
 func (t *tunnel) pathLost(reason string) {
 	t.mu.Lock()
 	down := t.downAt
+	t.lost = true
 	t.mu.Unlock()
 	f := map[string]any{"reason": reason}
 	if !down.IsZero() {
@@ -223,6 +242,9 @@ func (t *tunnel) close() {
 func (t *tunnel) closeWith(reason string) {
 	t.mu.Lock()
 	c := t.conn
+	if t.localWhy == "" && !t.closed {
+		t.localWhy = reason
+	}
 	t.mu.Unlock()
 	if c != nil && hasCap(t.peerCaps, capClose) {
 		c.SetWriteDeadline(time.Now().Add(2 * time.Second))

@@ -106,6 +106,25 @@ public data class PathStatus(
     val outageMs: Long? = null,
 )
 
+/**
+ * A desktop session served by this device (v1.1.0+), from the agent's
+ * session_open event until its session_close.
+ */
+public data class DeviceSession(
+    /** Short session id, the same on the desktop (`session_id` in path events) and in audit records. */
+    val id: String,
+    /** Who is connected: the desktop's label, the corporate user, or a key fingerprint. */
+    val peerLabel: String,
+    /** lan | relay-tcp | relay-ws | relay-wss (updated when the path changes). */
+    val transport: String,
+    /** "adb" for a debugging session, "adb-pair" while a desktop pairs its adb key. */
+    val kind: String = "adb",
+    /** When the session opened (epoch milliseconds). */
+    val openedAtMs: Long = 0,
+    /** Current path state; UP until a path_down. */
+    val path: PathState = PathState.UP,
+)
+
 /** Effective policy after merging the app config with device management. */
 public data class PolicyStatus(
     val mode: Mode = Mode.SOLO,

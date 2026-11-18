@@ -77,7 +77,7 @@ class ProtocolTest {
         val e = effective(SetuConfig("wss://relay.example/"), ManagedPolicy())
         val args = agentArgs(e, "/data/state", null)
         assertEquals(listOf("device", "--relay", "wss://relay.example/", "--adbd", "auto", "--state", "/data/state",
-            "--mode", "solo", "--lan-listen", "0.0.0.0:47100"), args)
+            "--mode", "solo", "--lan-listen", "0.0.0.0:47100", "--control-stdin"), args)
         assertFalse(e.policy.auditEnabled, "solo audit is off by default")
     }
 

@@ -153,7 +153,7 @@ func RunDesktop(ctx context.Context, cfg DesktopConfig) error {
 // terminate ends the whole session for good (hard cap reached, or the
 // device ended it): no more adb connections, every tunnel closed with
 // reason, and RunDesktop returns err. The first call wins.
-func (a *desktopAgent) terminate(err error, reason string) {
+func (a *desktopAgent) terminate(err error, reason string, extra ...any) {
 	a.mu.Lock()
 	if a.termErr != nil {
 		a.mu.Unlock()
@@ -163,7 +163,11 @@ func (a *desktopAgent) terminate(err error, reason string) {
 	ln := a.ln
 	a.mu.Unlock()
 	logf("session ended: %v", err)
-	a.events(reason, map[string]any{"device_id": a.deviceID, "reason": reason})
+	f := map[string]any{"device_id": a.deviceID, "reason": reason}
+	for i := 0; i+1 < len(extra); i += 2 {
+		f[fmt.Sprint(extra[i])] = extra[i+1]
+	}
+	a.events(reason, f)
 	a.record(audit.Event{"event": "session_terminated", "reason": reason})
 	if ln != nil {
 		ln.Close()
@@ -390,7 +394,7 @@ func (a *desktopAgent) serveADB(conn net.Conn, id, lan string, params initiatorP
 		// The device's clock reached the cap first: it is authoritative.
 		a.terminate(fmt.Errorf("%w: %w: ended by the device; connect again to re-authenticate", errDenied, ErrSessionExpired), why)
 	default:
-		a.terminate(fmt.Errorf("%w: %w: %s", errDenied, ErrPeerClosed, why), "peer_closed")
+		a.terminate(fmt.Errorf("%w: %w: %s", errDenied, ErrPeerClosed, why), "peer_closed", "peer_reason", why)
 	}
 	if obs != nil {
 		obs.finish()
